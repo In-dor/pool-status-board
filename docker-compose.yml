@@ -7,15 +7,15 @@ services:
     container_name: pool-status-board
     restart: unless-stopped
     ports:
-      - "18380:8080"
+      - "${BOARD_PORT:-18380}:8080"
     environment:
-      TZ: Asia/Shanghai
+      TZ: ${TZ:-Asia/Shanghai}
       LISTEN_ADDR: ":8080"
-      REFRESH_INTERVAL_SECONDS: "60"
+      REFRESH_INTERVAL_SECONDS: "${REFRESH_INTERVAL_SECONDS:-60}"
       VIEW_PASSCODE: "${VIEW_PASSCODE:-}"
-      CPAMP_BASE_URL: "http://cpa-manager-plus:18317"
-      AIS_BASE_URL: "http://aistudio2api:2048"
-      CPA_CONTAINER_AUTH_DIR: "/root/.cli-proxy-api"
+      CPAMP_BASE_URL: "${CPAMP_BASE_URL:-http://cpa-manager-plus:18317}"
+      AIS_BASE_URL: "${AIS_BASE_URL:-http://aistudio2api:2048}"
+      CPA_CONTAINER_AUTH_DIR: "${CPA_CONTAINER_AUTH_DIR:-/root/.cli-proxy-api}"
       HTTP_PROXY: ""
       HTTPS_PROXY: ""
       http_proxy: ""
@@ -23,10 +23,10 @@ services:
       ALL_PROXY: ""
       all_proxy: ""
     volumes:
-      - /vol1/1000/docker/CLIProxyAPI/auths:/mnt/cpa/auths:ro
-      - /vol1/1000/docker/CLIProxyAPI/data/antigravity-priority:/mnt/cpa/priority:ro
-      - /vol1/1000/docker/CLIProxyAPI/plugins/data/lamplighter:/mnt/cpa/lamplighter:ro
-      - /vol1/1000/docker-build/AIStudio2API/.env:/mnt/ais/.env:ro
+      - ${CPA_AUTHS_DIR:-/vol1/1000/docker/CLIProxyAPI/auths}:/mnt/cpa/auths:ro
+      - ${CPA_PRIORITY_DIR:-/vol1/1000/docker/CLIProxyAPI/data/antigravity-priority}:/mnt/cpa/priority:ro
+      - ${CPA_LAMPLIGHTER_DIR:-/vol1/1000/docker/CLIProxyAPI/plugins/data/lamplighter}:/mnt/cpa/lamplighter:ro
+      - ${AIS_ENV_FILE:-/vol1/1000/docker-build/AIStudio2API/.env}:/mnt/ais/.env:ro
       - ./quotas.json:/app/quotas.json:ro
       - ./secrets:/mnt/secrets:ro
     networks:
@@ -41,6 +41,8 @@ services:
 
 networks:
   cli-proxy-api_default:
+    name: ${CPA_DOCKER_NETWORK:-cli-proxy-api_default}
     external: true
   aistudio2api_default:
+    name: ${AIS_DOCKER_NETWORK:-aistudio2api_default}
     external: true

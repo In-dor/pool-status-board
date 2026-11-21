@@ -34,12 +34,18 @@ Pool-Status-Board/
 ```bash
 cp .env.example .env
 chmod 600 .env
-# 按需在 .env 中设置 VIEW_PASSCODE（留空则关闭口令保护）
+# 1) 按实际宿主机路径修改 .env 中的 CPA_* / AIS_ENV_FILE 与外部网络名
+# 2) 按需在 .env 中设置 VIEW_PASSCODE（留空则关闭口令保护）
 
 mkdir -p secrets
 chmod 700 secrets
 # 将 CPAMP Admin Key 写入 secrets/cpamp_admin_key（权限建议 600），支持运行时自动热加载
 ```
+
+### 配套客户端插件
+
+如需直接在 **OpenChamber**（顶栏下拉 / Usage 页 / Work Status / 侧边栏 / 手机端 / 桌面托盘）或 **OpenCode V2 终端 TUI** 中零 Token 实时查看窗口额度，可搭配安装：
+- **[openchamber-pool-quota](https://github.com/In-dor/openchamber-pool-quota)**
 
 ### 2. 构建与更新
 
