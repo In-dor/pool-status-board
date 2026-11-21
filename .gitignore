@@ -1,0 +1,14 @@
+# Secrets & local runtime credentials (NEVER commit)
+secrets/
+*.key
+*.pem
+.env
+.env.*
+!.env.example
+
+# Build artifacts, logs & temporary files
+pool-status-board
+*.out
+*.log
+*.tmp
+.DS_Store

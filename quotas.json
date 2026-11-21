@@ -1,0 +1,98 @@
+{
+  "reset_timezone": "Asia/Shanghai",
+  "reset_hour": 16,
+  "reset_minute": 0,
+  "rule_note": "每日北京时间 16:00 重置；单账号单模型次数与 Token 任一耗尽即视为该账号该模型不可用（短板熔断）。",
+  "models": [
+    {
+      "id": "gemini-4-argon",
+      "label": "Gemini 4 Argon",
+      "tiers": {
+        "Free":  { "requests": 0,   "tokens": 0 },
+        "Pro":   { "requests": 50,  "tokens": 15000000 },
+        "Ultra": { "requests": 150, "tokens": 20000000 }
+      }
+    },
+    {
+      "id": "gemini-4-carbon",
+      "label": "Gemini 4 Carbon",
+      "tiers": {
+        "Free":  { "requests": 0,   "tokens": 0 },
+        "Pro":   { "requests": 0,   "tokens": 0 },
+        "Ultra": { "requests": 150, "tokens": 20000000 }
+      }
+    },
+    {
+      "id": "gemini-4-neon",
+      "label": "Gemini 4 Neon",
+      "tiers": {
+        "Free":  { "requests": 0,   "tokens": 0 },
+        "Pro":   { "requests": 50,  "tokens": 15000000 },
+        "Ultra": { "requests": 150, "tokens": 20000000 }
+      }
+    },
+    {
+      "id": "gemini-4-hydrogen",
+      "label": "Gemini 4 Hydrogen",
+      "tiers": {
+        "Free":  { "requests": 50,  "tokens": 10000000 },
+        "Pro":   { "requests": 100, "tokens": 25000000 },
+        "Ultra": { "requests": 150, "tokens": 35000000 }
+      }
+    },
+    {
+      "id": "gemini-3.1-pro-preview",
+      "label": "Gemini 3.1 Pro Preview",
+      "tiers": {
+        "Free":  { "requests": 0,   "tokens": 0 },
+        "Pro":   { "requests": 50,  "tokens": 13000000 },
+        "Ultra": { "requests": 100, "tokens": 16000000 }
+      }
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "label": "Gemini 3.8 Flash",
+      "tiers": {
+        "Free":  { "requests": 50,  "tokens": 5000000 },
+        "Pro":   { "requests": 100, "tokens": 25000000 },
+        "Ultra": { "requests": 150, "tokens": 30000000 }
+      }
+    },
+    {
+      "id": "gemini-3.6-flash",
+      "label": "Gemini 3.6 Flash",
+      "tiers": {
+        "Free":  { "requests": 50,  "tokens": 5000000 },
+        "Pro":   { "requests": 100, "tokens": 25000000 },
+        "Ultra": { "requests": 150, "tokens": 30000000 }
+      }
+    },
+    {
+      "id": "gemini-3-flash-preview",
+      "label": "Gemini 3 Flash Preview",
+      "tiers": {
+        "Free":  { "requests": 50,  "tokens": 5000000 },
+        "Pro":   { "requests": 100, "tokens": 11000000 },
+        "Ultra": { "requests": 150, "tokens": 15000000 }
+      }
+    },
+    {
+      "id": "gemini-3.5-flash-lite",
+      "label": "Gemini 3.5 Flash Lite",
+      "tiers": {
+        "Free":  { "requests": 100, "tokens": 11000000 },
+        "Pro":   { "requests": 100, "tokens": 25000000 },
+        "Ultra": { "requests": 150, "tokens": 30000000 }
+      }
+    },
+    {
+      "id": "gemini-3.1-flash-lite",
+      "label": "Gemini 3.1 Flash Lite",
+      "tiers": {
+        "Free":  { "requests": 100, "tokens": 5000000 },
+        "Pro":   { "requests": 100, "tokens": 11000000 },
+        "Ultra": { "requests": 150, "tokens": 15000000 }
+      }
+    }
+  ]
+}
