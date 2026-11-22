@@ -265,7 +265,8 @@ func main() {
 	}
 	fileServer := http.FileServer(http.FS(subWeb))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+		p := r.URL.Path
+		if p == "/" || p == "/index.html" || strings.HasSuffix(p, ".css") || strings.HasSuffix(p, ".js") || strings.HasSuffix(p, ".svg") {
 			w.Header().Set("Cache-Control", "no-cache")
 		}
 		fileServer.ServeHTTP(w, r)
