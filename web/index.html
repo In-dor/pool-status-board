@@ -305,6 +305,9 @@
       gap: 12px;
       margin-bottom: 14px;
     }
+    .kpi-grid.kpi-grid-3 {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
     .kpi-card {
       background: var(--surface);
       border: 1px solid var(--border);
@@ -1332,12 +1335,16 @@
     }
 
     @media (max-width: 960px) {
-      .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .kpi-grid,
+      .kpi-grid.kpi-grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .kpi-grid.kpi-grid-3 > .kpi-card:last-child { grid-column: 1 / -1; }
       .ag-windows { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
       .container { padding: 10px 8px 36px; }
-      .kpi-grid { grid-template-columns: 1fr; }
+      .kpi-grid,
+      .kpi-grid.kpi-grid-3 { grid-template-columns: 1fr; }
+      .kpi-grid.kpi-grid-3 > .kpi-card:last-child { grid-column: auto; }
       .ag-grid { grid-template-columns: 1fr; }
       .ag-stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .ais-acc-grid { grid-template-columns: 1fr; }
@@ -3438,10 +3445,9 @@
 
         const c = ais.account_counts || {};
         const pg = ais.playground || {};
-        const bd = ais.build || {};
 
         const kpiHtml = `
-          <div class="kpi-grid">
+          <div class="kpi-grid kpi-grid-3">
             <div class="kpi-card">
               <div class="kpi-label">
                 <span>运行状态与账号槽位</span>
@@ -3477,19 +3483,6 @@
                 <span>均值 ${fmtMs(pg.first_event_avg_ms)}</span>
                 <span>P50 ${fmtMs(pg.first_event_p50_ms)}</span>
                 <span>P95 ${fmtMs(pg.first_event_p95_ms)}</span>
-              </div>
-            </div>
-
-            <div class="kpi-card">
-              <div class="kpi-label">
-                <span>Build 备用通道（独立分流）</span>
-                <span class="badge badge-slate">不扣 Playground</span>
-              </div>
-              <div class="kpi-val num">${fmtInt(bd.requests)} <span style="font-size:13px;font-weight:500;color:var(--text-3)">次</span></div>
-              <div class="kpi-sub num">
-                <span>Token ${fmtCompact(bd.total_tokens)}</span>
-                ${bd.success_rate != null ? `<span>成功率 ${fmtPct(bd.success_rate, 1)}</span>` : ''}
-                ${bd.active_cooldowns > 0 ? `<span style="color:var(--amber-text)">冷却 ${bd.active_cooldowns}</span>` : ''}
               </div>
             </div>
           </div>

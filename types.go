@@ -157,7 +157,6 @@ type AIStudioPool struct {
 	TierCounts    map[string]int         `json:"tier_counts"`
 	AccountCounts AIStudioAccountCounts  `json:"account_counts"`
 	Playground    AIStudioChannelSummary `json:"playground"`
-	Build         AIStudioChannelSummary `json:"build"`
 	HourlyBuckets []AIStudioHourlyBucket `json:"hourly_buckets"`
 	Models        []AIStudioModelSummary `json:"models"`
 	Accounts      []AIStudioAccount      `json:"accounts"`

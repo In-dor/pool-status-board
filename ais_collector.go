@@ -494,7 +494,7 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 		log.Printf("[ais] /api/cooldowns warning (code=%d): %v", code, err)
 	}
 
-	// 2. Fetch current cycle usage for playground + pairs + build
+	// 2. Fetch current cycle usage for playground + pairs
 	queryTo := now
 	if queryTo.Sub(cycleStart) < 2*time.Second {
 		queryTo = cycleStart.Add(2 * time.Second)
@@ -517,11 +517,6 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 		} else {
 			log.Printf("[ais] playground usage pairs warning (code=%d): %v", pairsCode, pairsErr)
 		}
-	}
-
-	var buildUsage aisUsageResp
-	if code, err := c.getJSON(ctx, fmt.Sprintf("/api/usage?from=%s&to=%s&channel=build&tz=%s&bucket=3600", fromStr, toStr, tzStr), &buildUsage); err != nil {
-		log.Printf("[ais] build usage warning (code=%d): %v", code, err)
 	}
 
 	// 3. Filter enabled accounts & assign deterministic anonymized code names
@@ -596,11 +591,10 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 		accTotalUsedTok[acc.publicID] += p.TotalTokens
 	}
 
-	// 5. Index active cooldowns (Playground vs Build kept strictly separate)
+	// 5. Index active cooldowns (global "*" and playground channel only)
 	globalCD := map[string]int64{}
 	pgModelCD := map[usageKey]int64{}
 	pgCooldownCount := 0
-	buildCooldownCount := 0
 
 	for _, cd := range cdResp.Cooldowns {
 		if !cd.Until.After(now) {
@@ -608,11 +602,7 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 		}
 		untilMs := cd.Until.UnixMilli()
 		ch := strings.ToLower(strings.TrimSpace(cd.Channel))
-		if ch == "build" {
-			buildCooldownCount++
-			continue
-		}
-		if ch != "" && ch != "playground" {
+		if ch != "" && ch != "*" && ch != "playground" {
 			continue
 		}
 		pgCooldownCount++
@@ -826,7 +816,6 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 	}
 
 	pool.Playground = toChannelSummary(pgUsage.Totals, pgCooldownCount)
-	pool.Build = toChannelSummary(buildUsage.Totals, buildCooldownCount)
 	pool.HourlyBuckets = toHourlyBuckets(pgUsage.Buckets)
 	return pool
 }
