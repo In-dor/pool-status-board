@@ -27,11 +27,11 @@
     ],
   };
 
-  // Lamplighter math constants (preserved 100%)
+  // Lamplighter math constants (tuned for 0.01% float precision)
   const LEVEL_EPSILON = 1e-6;
   const RESET_JUMP = 5;
   const RESET_DRIFT = 60;
-  const QUANTUM = 2;
+  const QUANTUM = 0.4;
   const HOLD_AFTER = 120;
   const CHAR_W = 6.4;
 
@@ -1162,11 +1162,95 @@
     `;
   }
 
-  // ---------- Lamplighter Math Engine (100% Preserved) ----------
-  function cycleFloor(points) {
+  // ---------- Lamplighter Math Engine ----------
+  function extractCycleResetTimes(series) {
+    if (!series) return [];
+    if (Array.isArray(series.cycle_resets)) {
+      const unique = [];
+      const sorted = series.cycle_resets
+        .map(Number)
+        .filter(t => Number.isFinite(t) && t > 0)
+        .sort((a, b) => a - b);
+      for (const t of sorted) {
+        if (!unique.length || unique[unique.length - 1] !== t) unique.push(t);
+      }
+      return unique;
+    }
+    const resets = Array.isArray(series.resets) ? series.resets : [];
+    const pts = Array.isArray(series.points) ? series.points : [];
+    const out = [];
+    for (let i = 1; i < resets.length; i++) {
+      const prev = resets[i - 1];
+      const cur = resets[i];
+      if (!Array.isArray(prev) || !Array.isArray(cur)) continue;
+      const prevEff = Number(prev[1]);
+      const curT = Number(cur[0]);
+      const curEff = Number(cur[1]);
+      if (!Number.isFinite(curT) || curT <= 0) continue;
+      if (prevEff > 0 && curEff > 0 && curEff > prevEff + RESET_DRIFT) {
+        out.push(curT);
+      } else if (prevEff > 0 && curEff === 0) {
+        let prevRem = null;
+        for (let k = pts.length - 1; k >= 0; k--) {
+          if (pts[k][0] < curT) {
+            prevRem = pts[k][1];
+            break;
+          }
+        }
+        if (prevRem != null && prevRem < 99.999) {
+          out.push(curT);
+        }
+      }
+    }
+    out.sort((a, b) => a - b);
+    return out;
+  }
+
+  function hasResetInRange(t0, t1, resetTimes) {
+    if (!resetTimes || !resetTimes.length) return false;
+    for (let i = 0; i < resetTimes.length; i++) {
+      const rt = resetTimes[i];
+      if (rt > t0 && rt <= t1) return true;
+      if (rt > t1) break;
+    }
+    return false;
+  }
+
+  function latestResetAtOrBefore(resetTimes, t) {
+    if (!resetTimes || !resetTimes.length) return null;
+    let best = null;
+    for (let i = 0; i < resetTimes.length; i++) {
+      if (resetTimes[i] <= t) best = resetTimes[i];
+      else break;
+    }
+    return best;
+  }
+
+  function findResetAnchorTime(prevT, curT, resetsMeta, winLen) {
+    if (!(winLen > 0) || !Array.isArray(resetsMeta) || !resetsMeta.length) return null;
+    let eff = 0;
+    for (let i = 0; i < resetsMeta.length; i++) {
+      const r = resetsMeta[i];
+      if (!Array.isArray(r)) continue;
+      if (r[0] <= curT + RESET_DRIFT) {
+        eff = Number(r[1]) || 0;
+      } else {
+        break;
+      }
+    }
+    if (!(eff > 0)) return null;
+    const anchorT = eff - winLen;
+    if (anchorT > prevT && anchorT < curT) return anchorT;
+    return null;
+  }
+
+  function cycleFloor(points, resetTimes = []) {
     let low = null;
+    let prevT = null;
     return points.map(p => {
-      low = (low == null || p[1] - low >= RESET_JUMP) ? p[1] : Math.min(low, p[1]);
+      const crossed = prevT != null && hasResetInRange(prevT, p[0], resetTimes);
+      low = (low == null || crossed || p[1] - low >= RESET_JUMP) ? p[1] : Math.min(low, p[1]);
+      prevT = p[0];
       return [p[0], low];
     });
   }
@@ -1198,24 +1282,41 @@
     });
   }
 
-  function splitAtResets(pts) {
+  function splitAtResets(pts, resetTimes = [], resetsMeta = [], winLen = 0) {
     if (!pts.length) return { parts: [], resets: [] };
     const parts = [[pts[0]]];
     const resets = [];
     for (let i = 1; i < pts.length; i++) {
-      const up = pts[i][1] - pts[i - 1][1] >= RESET_JUMP;
-      if (up && parts.length > 1 && parts[parts.length - 1].length === 1) {
-        parts[parts.length - 1] = [];
-        resets[resets.length - 1] = pts[i][0];
-      } else if (up) {
-        parts.push([]);
-        resets.push(pts[i][0]);
+      const prevT = pts[i - 1][0];
+      const curT = pts[i][0];
+      const byResetTime = hasResetInRange(prevT, curT, resetTimes);
+      const byJump = pts[i][1] - pts[i - 1][1] >= RESET_JUMP;
+      if (byResetTime || byJump) {
+        let resetMarkT = curT;
+        let anchorPt = null;
+        if (pts[i][1] < 100 - LEVEL_EPSILON) {
+          const anchorT = findResetAnchorTime(prevT, curT, resetsMeta, winLen);
+          if (anchorT != null) {
+            resetMarkT = anchorT;
+            anchorPt = [anchorT, 100];
+          }
+        }
+        if (!byResetTime && byJump && parts.length > 1 && parts[parts.length - 1].length === 1) {
+          parts[parts.length - 1] = anchorPt ? [anchorPt] : [];
+          resets[resets.length - 1] = resetMarkT;
+        } else {
+          parts.push(anchorPt ? [anchorPt] : []);
+          resets.push(resetMarkT);
+        }
       }
       parts[parts.length - 1].push(pts[i]);
     }
     for (let k = 0; k + 1 < parts.length; k++) {
       const tail = parts[k][parts[k].length - 1];
-      parts[k].push([parts[k + 1][0][0], tail[1]]);
+      const nextStartT = parts[k + 1][0][0];
+      if (nextStartT > tail[0]) {
+        parts[k].push([nextStartT, tail[1]]);
+      }
     }
     return { parts, resets };
   }
@@ -1250,6 +1351,73 @@
       if (i === 0 || i === pts.length - 1 || p[1] !== pts[i - 1][1]) return true;
       return Math.abs(pts[i + 1][1] - p[1]) > QUANTUM;
     });
+  }
+
+  // Exact evaluator matching Fritsch-Carlson monotone cubic spline in (t, pct) space
+  function buildMonotoneSpline(pts) {
+    const n = pts.length;
+    if (n === 0) return { evalPct: () => null };
+    if (n === 1) return { evalPct: () => pts[0][1] };
+    if (n === 2) {
+      const dt = pts[1][0] - pts[0][0];
+      return {
+        evalPct: (t) => {
+          if (!(dt > 0)) return pts[1][1];
+          const u = Math.max(0, Math.min(1, (t - pts[0][0]) / dt));
+          return pts[0][1] + u * (pts[1][1] - pts[0][1]);
+        },
+      };
+    }
+
+    const dx = new Array(n - 1);
+    const m = new Array(n - 1);
+    const tg = new Array(n);
+    for (let i = 0; i < n - 1; i++) {
+      dx[i] = pts[i + 1][0] - pts[i][0];
+      m[i] = dx[i] ? (pts[i + 1][1] - pts[i][1]) / dx[i] : 0;
+    }
+    tg[0] = m[0];
+    tg[n - 1] = m[n - 2];
+    for (let i = 1; i < n - 1; i++) {
+      tg[i] = m[i - 1] * m[i] <= 0 ? 0 : (m[i - 1] + m[i]) / 2;
+    }
+    for (let i = 0; i < n - 1; i++) {
+      if (!m[i]) { tg[i] = tg[i + 1] = 0; continue; }
+      const a = tg[i] / m[i];
+      const b = tg[i + 1] / m[i];
+      const h = a * a + b * b;
+      if (h > 9) {
+        const k = 3 / Math.sqrt(h);
+        tg[i] = k * a * m[i];
+        tg[i + 1] = k * b * m[i];
+      }
+    }
+
+    return {
+      evalPct: (t) => {
+        if (t <= pts[0][0]) return pts[0][1];
+        if (t >= pts[n - 1][0]) return pts[n - 1][1];
+        let lo = 0;
+        let hi = n - 2;
+        while (lo < hi) {
+          const mid = (lo + hi + 1) >> 1;
+          if (pts[mid][0] <= t) lo = mid;
+          else hi = mid - 1;
+        }
+        const i = lo;
+        const dt = dx[i];
+        if (!(dt > 0)) return pts[i + 1][1];
+        const u = (t - pts[i][0]) / dt;
+        const u2 = u * u;
+        const u3 = u2 * u;
+        const h00 = 2 * u3 - 3 * u2 + 1;
+        const h10 = u3 - 2 * u2 + u;
+        const h01 = -2 * u3 + 3 * u2;
+        const h11 = u3 - u2;
+        const val = h00 * pts[i][1] + h10 * (tg[i] * dt) + h01 * pts[i + 1][1] + h11 * (tg[i + 1] * dt);
+        return Math.max(0, Math.min(100, val));
+      },
+    };
   }
 
   // Fritsch-Carlson monotone cubic spline
@@ -1310,7 +1478,7 @@
     return out;
   }
 
-  function paceExtensions(segments, points, length) {
+  function paceExtensions(segments, points, length, resetTimes = []) {
     const out = [];
     const pts = points || [];
     segments.forEach((s, i) => {
@@ -1319,7 +1487,10 @@
       if (s[0] <= s[2] - length + RESET_DRIFT) return;
       let start = null;
       for (let k = 1; k < pts.length && pts[k][0] <= s[0]; k++) {
-        if (pts[k][0] >= s[2] - length - RESET_DRIFT && pts[k][1] - pts[k - 1][1] >= RESET_JUMP) {
+        if (
+          pts[k][0] >= s[2] - length - RESET_DRIFT &&
+          (pts[k][1] - pts[k - 1][1] >= RESET_JUMP || hasResetInRange(pts[k - 1][0], pts[k][0], resetTimes))
+        ) {
           start = pts[k][0];
         }
       }
@@ -1386,28 +1557,41 @@
     return lineFit(pts, last[0], last[1]).slope;
   }
 
-  function computeProjection(series, floor, g, lastRun, limit, windowKind, sampleStep) {
+  function computeProjection(series, floor, g, lastRun, limit, windowKind, sampleStep, resetTimes = []) {
     const pts = series.points || [];
-    if (!pts.length || g.to <= g.now || !lastRun || lastRun.end < g.now - limit) return null;
+    if (!pts.length || !floor.length || g.to <= g.now || !lastRun || lastRun.end < g.now - limit) return null;
     const last = pts[pts.length - 1];
     if (!(last[1] > 0)) return null;
 
     let rate = null;
     let t0 = lastRun.end;
     const winLen = WINDOW_SECONDS[windowKind];
+    const latestReset = latestResetAtOrBefore(resetTimes, g.now);
+
+    let startIdx = 0;
+    for (let i = 1; i < floor.length; i++) {
+      if (floor[i][1] > floor[i - 1][1] || hasResetInRange(floor[i - 1][0], floor[i][0], resetTimes)) {
+        startIdx = i;
+      }
+    }
+    if (latestReset != null) {
+      while (startIdx < floor.length - 1 && floor[startIdx][0] < latestReset) {
+        startIdx++;
+      }
+    }
 
     if (windowKind === '7d') {
       const resetSec = series.reset_sec;
-      const start = resetSec - winLen;
+      let start = resetSec - winLen;
+      if (latestReset != null && latestReset > start) {
+        start = latestReset;
+      }
       const low = floor[floor.length - 1];
-      if (low && resetSec > g.now && start < g.now && low[0] >= start) {
+      const cycleStartPt = floor[startIdx];
+      if (low && resetSec > g.now && start < g.now && low[0] >= start && (!cycleStartPt || low[0] >= cycleStartPt[0])) {
         rate = -(100 - low[1]) / (g.now - start);
       }
     } else {
-      let startIdx = 0;
-      for (let i = 1; i < floor.length; i++) {
-        if (floor[i][1] > floor[i - 1][1]) startIdx = i;
-      }
       const cycPts = floor.slice(startIdx);
       const tail = cycPts[cycPts.length - 1];
       const held = (g.now - tail[0]) > Math.max(HOLD_AFTER, sampleStep * 1.5);
@@ -1613,10 +1797,14 @@
     }
     const axisFrom = axisEnd - rawSpan;
 
-    const rows = hist.series.map(s => ({
-      ...s,
-      floor: cycleFloor(s.points || []),
-    }));
+    const rows = hist.series.map(s => {
+      const cycleResetTimes = extractCycleResetTimes(s);
+      return {
+        ...s,
+        cycleResetTimes,
+        floor: cycleFloor(s.points || [], cycleResetTimes),
+      };
+    });
     const selectedRow = rows.find(r => r.group === selectedSeries.group) || rows[0];
     const winLen = WINDOW_SECONDS[hist.window];
     const stretches = splitRuns(selectedRow.points || [], limit, nowSec);
@@ -1628,7 +1816,8 @@
       lastRun,
       limit,
       hist.window,
-      sampleStep
+      sampleStep,
+      selectedRow.cycleResetTimes
     );
 
     // Freed left gutter! Only Y-axis tick width needed on the left.
@@ -1901,13 +2090,17 @@
       const tail = pts[pts.length - 1];
       const endT = (ahead && run === lastRun) ? ahead.t0 : run.end;
       if (endT > tail[0]) pts.push([endT, tail[1]]);
-      return { pts, split: splitAtResets(pts) };
+      return {
+        pts,
+        split: splitAtResets(pts, selectedRow.cycleResetTimes, selectedRow.resets, winLen),
+      };
     });
     const allResets = [];
     for (const pc of pieces) allResets.push(...pc.split.resets);
+    allResets.sort((a, b) => a - b);
 
     const pSegs = paceSegments(selectedRow.resets, winLen, selectedRow.reset_sec, g.now);
-    const pExts = paceExtensions(pSegs, selectedRow.points, winLen);
+    const pExts = paceExtensions(pSegs, selectedRow.points, winLen, selectedRow.cycleResetTimes);
     const paceNow = paceAt(pSegs, winLen, g.now);
     const diffNow = paceNow == null ? null : Math.round(selectedRow.remaining - paceNow);
     const diffCls = diffNow == null ? '' : diffNow > 0 ? 'ahead' : diffNow < 0 ? 'behind' : '';
@@ -2111,9 +2304,20 @@
     }
 
     // Cycle burn curves with model-family gradient stroke + soft area fill
+    const renderedCurves = [];
     for (const piece of pieces) {
-      for (const part of piece.split.parts) {
+      const nParts = piece.split.parts.length;
+      for (let pi = 0; pi < nParts; pi++) {
+        const part = piece.split.parts[pi];
         const smoothed = curvePoints(declining(part));
+        if (!smoothed.length) continue;
+        const spline = buildMonotoneSpline(smoothed);
+        renderedCurves.push({
+          tStart: smoothed[0][0],
+          tEnd: smoothed[smoothed.length - 1][0],
+          rightOpen: pi + 1 < nParts,
+          spline,
+        });
         const xy = smoothed.map(p => [g.x(p[0]), yOf(p[1])]);
         if (xy.length === 1) xy.push([xy[0][0] + 1, xy[0][1]]);
         const d = monotonePath(xy);
@@ -2123,27 +2327,47 @@
         plot.appendChild(svgEl('path', {
           d, fill: 'none', stroke: `url(#${detailUid}_stroke)`,
           'stroke-width': 2.35, 'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+          'data-role': 'burn-curve',
         }));
       }
     }
 
-    // Reset vertical markers + top labels
+    function evalCurvePct(t) {
+      for (let i = 0; i < renderedCurves.length; i++) {
+        const c = renderedCurves[i];
+        if (t >= c.tStart && (c.rightOpen ? t < c.tEnd : t <= c.tEnd)) {
+          return c.spline.evalPct(t);
+        }
+      }
+      for (let i = renderedCurves.length - 1; i >= 0; i--) {
+        const c = renderedCurves[i];
+        if (t >= c.tStart && t <= c.tEnd) {
+          return c.spline.evalPct(t);
+        }
+      }
+      return null;
+    }
+
+    // Reset vertical markers + top labels (all dashed lines kept; labels collision-filtered)
     let lastResetLblX = -999;
-    const resetMinGap = isMobile ? 42 : 52;
+    const resetMinGap = isMobile ? 44 : 48;
     for (const rt of allResets) {
       if (rt < g.from || rt > g.to) continue;
       const rx = g.x(rt);
       detailSvg.appendChild(svgEl('line', {
         x1: rx, x2: rx, y1: padT - 4, y2: padT + plotH,
         stroke: colText3, 'stroke-opacity': 0.65, 'stroke-dasharray': '3 3',
+        'data-role': 'reset-line',
+        'data-ts': rt,
       }));
-      if (rx - lastResetLblX > resetMinGap && rx > labelW + 12 && rx < labelW + plotW - 12) {
+      if (rx - lastResetLblX >= resetMinGap && rx > labelW + 12 && rx < labelW + plotW - 12) {
         const rLabel = hist.window === '7d' ? '↻' + fmtDay(rt * 1000) : '↻' + fmtHM(rt * 1000);
         detailSvg.appendChild(svgText({
           x: rx, y: padT - 6,
           'text-anchor': 'middle',
           'font-size': isMobile ? 9.5 : 10,
           fill: colText3,
+          'data-role': 'reset-label',
         }, rLabel));
         lastResetLblX = rx;
       }
@@ -2181,16 +2405,17 @@
     // Latest live sample dot
     const latestPt = (selectedRow.points || [])[selectedRow.points.length - 1];
     if (latestPt && lastRun && lastRun.end >= g.now - limit) {
-      const lx = g.x(ahead ? ahead.t0 : lastRun.end);
+      const lt = ahead ? ahead.t0 : lastRun.end;
+      const lv = evalCurvePct(lt);
       detailSvg.appendChild(svgEl('circle', {
-        cx: lx, cy: yOf(latestPt[1]), r: 4.2,
+        cx: g.x(lt), cy: yOf(lv != null ? lv : latestPt[1]), r: 4.2,
         fill: fam.a, stroke: colSurface, 'stroke-width': 2,
       }));
     }
 
     // Crosshair & Hover/Touch Scrubbing
     const detailCross = svgEl('line', { y1: padT, y2: padT + plotH, stroke: fam.a, 'stroke-opacity': 0.85, 'stroke-width': 1.2, visibility: 'hidden', 'pointer-events': 'none' });
-    const detailDot = svgEl('circle', { r: 4.5, fill: fam.a, stroke: colSurface, 'stroke-width': 2, visibility: 'hidden', 'pointer-events': 'none' });
+    const detailDot = svgEl('circle', { r: 4.5, fill: fam.a, stroke: colSurface, 'stroke-width': 2, visibility: 'hidden', 'pointer-events': 'none', 'data-role': 'detail-dot' });
     detailSvg.appendChild(detailCross);
     detailSvg.appendChild(detailDot);
 
@@ -2264,8 +2489,10 @@
         const p = valueAt(selectedRow.points || [], t);
         const valid = p && (t - p[0] <= limit);
         if (valid) {
-          detailDot.setAttribute('cx', g.x(p[0]));
-          detailDot.setAttribute('cy', yOf(p[1]));
+          const dotT = p[0];
+          const curveVal = evalCurvePct(dotT);
+          detailDot.setAttribute('cx', g.x(dotT));
+          detailDot.setAttribute('cy', yOf(curveVal != null ? curveVal : p[1]));
           detailDot.setAttribute('visibility', 'visible');
         } else {
           detailDot.setAttribute('visibility', 'hidden');
@@ -2329,7 +2556,9 @@
       }
       const nearSec = (g.to - g.from) / plotW * 8;
       const nearReset = allResets.find(r => r >= g.from && Math.abs(r - t) <= nearSec);
-      const noteHtml = nearReset ? `<div class="lamp-tip-note">↻ ${fmtHM(nearReset * 1000)} 周期重置</div>` : '';
+      const noteHtml = nearReset
+        ? `<div class="lamp-tip-note">↻ ${hist.window === '7d' ? fmtDateTime(nearReset * 1000) : fmtHM(nearReset * 1000)} 周期重置</div>`
+        : '';
 
       detailTip.innerHTML = `<div class="lamp-tip-time">${fmtDateTime(t * 1000)}</div>${rowsHtml.join('')}${noteHtml}`;
       detailTip.hidden = false;

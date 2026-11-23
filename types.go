@@ -137,8 +137,9 @@ type AntigravityHistorySeries struct {
 	ResetSec        int64        `json:"reset_sec"`     // effective reset sec; 0 when unopened full window
 	RawResetSec     int64        `json:"raw_reset_sec"` // raw reset sec from state/history
 	ObservedSec     int64        `json:"observed_sec"`
-	Points          [][2]float64 `json:"points"` // [[t_sec, remaining], ...]
-	Resets          [][2]int64   `json:"resets"` // [[t_sec, effective_reset_sec], ...]
+	Points          [][2]float64 `json:"points"`                 // [[t_sec, remaining], ...]
+	Resets          [][2]int64   `json:"resets"`                 // [[t_sec, effective_reset_sec], ...]
+	CycleResets     []int64      `json:"cycle_resets,omitempty"` // sample timestamps (t_sec) where real cycle resets occur
 }
 
 // ---------- AIStudio2API ----------

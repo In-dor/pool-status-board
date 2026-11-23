@@ -1313,11 +1313,28 @@ func (c *CPACollector) GetAccountHistory(accountID, windowKind, rangeName string
 		if !exists {
 			continue
 		}
-		pts := downsampleHistoryPoints(wh.Points, fromSec, toSec, bucketSec, wh.DurationSeconds)
-		resets := extractEffectiveResets(wh.Points, fromSec, toSec, wh.DurationSeconds)
+		eff := resolveEffectiveResetTimeline(wh.Points, toSec, wh.DurationSeconds)
+		sampled := downsampleHistoryPoints(wh.Points, eff, fromSec, toSec, bucketSec)
 
-		// Re-check effective reset against current time
+		pts := make([][2]float64, len(sampled))
+		for i, p := range sampled {
+			pts[i] = [2]float64{float64(p.T), p.R}
+		}
+		cycleResets := extractCycleResets(sampled)
+		resets := extractEffectiveResets(wh.Points, eff, fromSec, toSec, wh.DurationSeconds)
+
+		// Re-check effective reset against current time; honor tail-protected timeline if consistent
 		resetSec := wh.ResetSec
+		if resetSec == 0 && len(wh.Points) > 0 {
+			for i := len(wh.Points) - 1; i >= 0; i-- {
+				if wh.Points[i].T <= toSec {
+					if eff[i] > toSec && (wh.RawResetSec == 0 || absInt64(eff[i]-wh.RawResetSec) <= lampResetDriftSec) {
+						resetSec = eff[i]
+					}
+					break
+				}
+			}
+		}
 		if resetSec > 0 && resetSec <= toSec {
 			resetSec = 0
 		}
@@ -1333,14 +1350,120 @@ func (c *CPACollector) GetAccountHistory(accountID, windowKind, rangeName string
 			ObservedSec:     wh.ObservedSec,
 			Points:          pts,
 			Resets:          resets,
+			CycleResets:     cycleResets,
 		})
 	}
 	return resp, true
 }
 
-func extractEffectiveResets(pts []lampHistoryPoint, fromSec, toSec, durationSec int64) [][2]int64 {
+type resolvedHistoryPoint struct {
+	lampHistoryPoint
+	Eff int64
+}
+
+func resolveEffectiveResetTimeline(pts []lampHistoryPoint, toSec, durationSec int64) []int64 {
+	eff := make([]int64, len(pts))
+	if len(pts) == 0 || durationSec <= 0 {
+		return eff
+	}
+
+	var prevEff int64
+	for i, p := range pts {
+		if p.T > toSec {
+			break
+		}
+		ex := effectiveResetSec(p.T, p.R, p.X, durationSec)
+
+		// Multi-step forward lookahead:
+		// If a 100% sample sits right after a reset (within 120s of full duration), scan all
+		// consecutive samples keeping the same anchored reset timestamp (within drift). If any
+		// sample starts consuming (< 99.999) or stays anchored > 2*drift without sliding forward,
+		// confirm p.X as an anchored effective reset timestamp.
+		if ex == 0 && p.X > 0 {
+			for j := i + 1; j < len(pts) && pts[j].T <= toSec; j++ {
+				nxt := pts[j]
+				if nxt.X <= 0 || absInt64(nxt.X-p.X) > lampResetDriftSec {
+					break
+				}
+				if nxt.R < 99.999 || (nxt.T-p.T) > lampResetDriftSec*2 {
+					ex = p.X
+					break
+				}
+			}
+		}
+
+		// Tail fresh-reset protection:
+		// Near the tail (within 2*drift of toSec), if a prior anchored cycle exists and p.X
+		// stepped forward by one cycle duration (or continues that newly confirmed tail cycle),
+		// confirm p.X directly to prevent 1~2 minute flicker to 0.
+		if ex == 0 && p.X > 0 && prevEff > 0 && toSec-p.T <= lampResetDriftSec*2 {
+			if absInt64(p.X-prevEff-durationSec) <= lampResetDriftSec || absInt64(p.X-prevEff) <= lampResetDriftSec {
+				ex = p.X
+			}
+		}
+
+		eff[i] = ex
+		prevEff = ex
+	}
+
+	// Single-point transient unopened glitch filter:
+	// Smooth isolated eff[i] == 0 sandwiched by identical anchored cycles.
+	for i := 1; i+1 < len(pts); i++ {
+		if pts[i].T > toSec || pts[i+1].T > toSec {
+			break
+		}
+		if eff[i] == 0 && eff[i-1] > 0 && eff[i+1] > 0 && absInt64(eff[i-1]-eff[i+1]) <= lampResetDriftSec {
+			eff[i] = eff[i-1]
+		}
+	}
+
+	return eff
+}
+
+func isCycleReset(prev, cur lampHistoryPoint, prevEff, curEff int64) bool {
+	// Explicit non-reset exclusions:
+	// 1. Opening an unopened 100% sliding window on first consumption
+	if prevEff == 0 && curEff > 0 && prev.R >= 99.999 {
+		return false
+	}
+	// 2. Full idle window releasing back to unopened sliding window
+	if prevEff > 0 && curEff == 0 && prev.R >= 99.999 {
+		return false
+	}
+	// Condition A: anchored cycle advanced to a later reset timestamp
+	if prevEff > 0 && curEff > 0 && curEff > prevEff+lampResetDriftSec {
+		return true
+	}
+	// Condition B: consumed anchored cycle reset into unopened 100% state
+	if prevEff > 0 && curEff == 0 && prev.R < 99.999 && cur.R >= 99.999 {
+		return true
+	}
+	// Condition C: fallback when reset timestamp is missing or unchanged on a sharp jump
+	if cur.R-prev.R >= lampResetJumpPercent {
+		return true
+	}
+	return false
+}
+
+func extractCycleResets(sampled []resolvedHistoryPoint) []int64 {
+	if len(sampled) < 2 {
+		return nil
+	}
+	var out []int64
+	for i := 1; i < len(sampled); i++ {
+		if isCycleReset(sampled[i-1].lampHistoryPoint, sampled[i].lampHistoryPoint, sampled[i-1].Eff, sampled[i].Eff) {
+			out = append(out, sampled[i].T)
+		}
+	}
+	return out
+}
+
+func extractEffectiveResets(pts []lampHistoryPoint, eff []int64, fromSec, toSec, durationSec int64) [][2]int64 {
 	if len(pts) == 0 || durationSec <= 0 {
 		return [][2]int64{}
+	}
+	if len(eff) != len(pts) {
+		eff = resolveEffectiveResetTimeline(pts, toSec, durationSec)
 	}
 	scanFrom := fromSec - durationSec
 	var transitions [][2]int64
@@ -1354,15 +1477,7 @@ func extractEffectiveResets(pts []lampHistoryPoint, fromSec, toSec, durationSec 
 		if p.T < scanFrom {
 			continue
 		}
-		ex := effectiveResetSec(p.T, p.R, p.X, durationSec)
-		// If a 100% sample sits right at a cycle reset and the next sample keeps the same anchored x
-		// (either already started consuming, or >2m elapsed without x sliding forward), it was already anchored.
-		if ex == 0 && p.X > 0 && i+1 < len(pts) && pts[i+1].T <= toSec {
-			nxt := pts[i+1]
-			if absInt64(nxt.X-p.X) <= lampResetDriftSec && (nxt.R < 99.999 || (nxt.T-p.T) > lampResetDriftSec*2) {
-				ex = p.X
-			}
-		}
+		ex := eff[i]
 		changed := false
 		if !hasLast {
 			changed = true
@@ -1395,9 +1510,9 @@ func extractEffectiveResets(pts []lampHistoryPoint, fromSec, toSec, durationSec 
 	return out
 }
 
-func downsampleHistoryPoints(pts []lampHistoryPoint, fromSec, toSec, bucketSec, durationSec int64) [][2]float64 {
+func downsampleHistoryPoints(pts []lampHistoryPoint, eff []int64, fromSec, toSec, bucketSec int64) []resolvedHistoryPoint {
 	if len(pts) == 0 {
-		return [][2]float64{}
+		return []resolvedHistoryPoint{}
 	}
 	maxLeadGap := bucketSec
 	if maxLeadGap < lampDefaultStepSec {
@@ -1405,64 +1520,62 @@ func downsampleHistoryPoints(pts []lampHistoryPoint, fromSec, toSec, bucketSec, 
 	}
 	maxLeadGap *= 4
 
-	var lead *lampHistoryPoint
-	var inRange []lampHistoryPoint
+	var lead *resolvedHistoryPoint
+	var inRange []resolvedHistoryPoint
 	for i := range pts {
 		p := pts[i]
 		if p.T > toSec {
 			break
 		}
+		var ex int64
+		if i < len(eff) {
+			ex = eff[i]
+		}
+		rp := resolvedHistoryPoint{lampHistoryPoint: p, Eff: ex}
 		if p.T < fromSec {
-			lead = &pts[i]
+			cp := rp
+			lead = &cp
 			continue
 		}
-		inRange = append(inRange, p)
+		inRange = append(inRange, rp)
 	}
 
-	var slice []lampHistoryPoint
+	var slice []resolvedHistoryPoint
 	if lead != nil && fromSec-lead.T <= maxLeadGap {
-		slice = make([]lampHistoryPoint, 0, len(inRange)+1)
+		slice = make([]resolvedHistoryPoint, 0, len(inRange)+1)
 		slice = append(slice, *lead)
 		slice = append(slice, inRange...)
 	} else {
 		slice = inRange
 	}
 	if len(slice) == 0 {
-		return [][2]float64{}
+		return []resolvedHistoryPoint{}
 	}
 
 	if bucketSec <= 0 {
-		out := make([][2]float64, 0, len(slice))
-		for _, p := range slice {
-			out = append(out, [2]float64{float64(p.T), p.R})
-		}
-		return out
+		return slice
 	}
 
 	// Reset-preserving time-bucket downsampling:
 	// Within each bucket keep the lowest remaining point, BUT flush immediately
-	// before & after any reset jump (>= 5% or reset timestamp jump) so reset edges stay razor-sharp.
-	out := make([][2]float64, 0, len(slice)/2+4)
+	// before & after any cycle reset (resolved via timeline + isCycleReset) so micro-reset
+	// pre-reset lows and post-reset 100% peaks are always preserved.
+	out := make([]resolvedHistoryPoint, 0, len(slice)/2+4)
 	curBucket := slice[0].T / bucketSec
 	bucketMin := slice[0]
 	prev := slice[0]
-	prevEffX := effectiveResetSec(prev.T, prev.R, prev.X, durationSec)
 
-	appendPoint := func(p lampHistoryPoint) {
-		if len(out) > 0 && int64(out[len(out)-1][0]) == p.T {
-			out[len(out)-1][1] = p.R
+	appendPoint := func(p resolvedHistoryPoint) {
+		if len(out) > 0 && out[len(out)-1].T == p.T {
+			out[len(out)-1] = p
 			return
 		}
-		out = append(out, [2]float64{float64(p.T), p.R})
+		out = append(out, p)
 	}
 
 	for i := 1; i < len(slice); i++ {
 		p := slice[i]
-		curEffX := effectiveResetSec(p.T, p.R, p.X, durationSec)
-		isResetJump := (p.R - prev.R) >= lampResetJumpPercent ||
-			(curEffX > 0 && prevEffX > 0 && absInt64(curEffX-prevEffX) > lampResetDriftSec && p.R > prev.R+0.5)
-
-		if isResetJump {
+		if isCycleReset(prev.lampHistoryPoint, p.lampHistoryPoint, prev.Eff, p.Eff) {
 			appendPoint(bucketMin)
 			if prev.T != bucketMin.T {
 				appendPoint(prev)
@@ -1471,7 +1584,6 @@ func downsampleHistoryPoints(pts []lampHistoryPoint, fromSec, toSec, bucketSec, 
 			curBucket = p.T / bucketSec
 			bucketMin = p
 			prev = p
-			prevEffX = curEffX
 			continue
 		}
 
@@ -1484,7 +1596,6 @@ func downsampleHistoryPoints(pts []lampHistoryPoint, fromSec, toSec, bucketSec, 
 			bucketMin = p
 		}
 		prev = p
-		prevEffX = curEffX
 	}
 	appendPoint(bucketMin)
 	// Always preserve the very last raw sample accurately
