@@ -34,9 +34,11 @@ type QuotasFile struct {
 }
 
 type QuotaModelEntry struct {
-	ID    string                    `json:"id"`
-	Label string                    `json:"label"`
-	Tiers map[string]QuotaTierLimit `json:"tiers"`
+	ID       string                    `json:"id"`
+	Label    string                    `json:"label"`
+	Category string                    `json:"category,omitempty"`
+	Aliases  []string                  `json:"aliases,omitempty"`
+	Tiers    map[string]QuotaTierLimit `json:"tiers"`
 }
 
 type QuotaTierLimit struct {
@@ -107,12 +109,13 @@ type aisCooldownsResp struct {
 }
 
 type aisRawCooldown struct {
-	AccountID    string    `json:"account_id"`
-	AccountLabel string    `json:"account_label"`
-	Channel      string    `json:"channel"`
-	ModelID      string    `json:"model_id"`
-	Scope        string    `json:"scope"`
-	Until        time.Time `json:"until"`
+	AccountID        string    `json:"account_id"`
+	AccountLabel     string    `json:"account_label"`
+	Channel          string    `json:"channel"`
+	ModelID          string    `json:"model_id"`
+	Scope            string    `json:"scope"`
+	Until            time.Time `json:"until"`
+	RemainingSeconds float64   `json:"remaining_seconds,omitempty"`
 }
 
 type aisUsageLatency struct {
@@ -461,7 +464,7 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 	if qf != nil && qf.RuleNote != "" {
 		pool.ResetRuleNote = qf.RuleNote
 	} else {
-		pool.ResetRuleNote = "每日北京时间 16:00 重置；次数与 Token 任一用尽即视为该账号该模型耗尽。"
+		pool.ResetRuleNote = "每日北京时间 16:00 重置；文本模型按单账号次数与 Token 短板熔断，画图模型按单账号次数计额。"
 	}
 	if qErr != nil {
 		pool.Online = false
@@ -566,7 +569,8 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 		}
 	}
 
-	// 4. Index Playground usage pairs by (account publicID, modelID)
+	// 4. Build model alias lookup map & index Playground usage pairs by (account publicID, modelID)
+	aliasMap := buildModelAliasMap(qf)
 	type usageKey struct {
 		accID   string
 		modelID string
@@ -580,7 +584,7 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 		if acc == nil {
 			continue
 		}
-		modelID := normalizeModelID(p.Model)
+		modelID := normalizeModelID(p.Model, aliasMap)
 		k := usageKey{accID: acc.publicID, modelID: modelID}
 		prev := pairUsage[k]
 		prev.Requests += p.Requests
@@ -597,10 +601,10 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 	pgCooldownCount := 0
 
 	for _, cd := range cdResp.Cooldowns {
-		if !cd.Until.After(now) {
+		untilMs := resolveCooldownUntilMs(cd, now)
+		if untilMs <= nowMs {
 			continue
 		}
-		untilMs := cd.Until.UnixMilli()
 		ch := strings.ToLower(strings.TrimSpace(cd.Channel))
 		if ch != "" && ch != "*" && ch != "playground" {
 			continue
@@ -616,7 +620,7 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 		}
 
 		scope := strings.TrimSpace(cd.Scope)
-		modelID := normalizeModelID(cd.ModelID)
+		modelID := normalizeModelID(cd.ModelID, aliasMap)
 
 		if scope == "*" || modelID == "*" || (modelID == "" && scope == "") {
 			if untilMs > globalCD[acc.publicID] {
@@ -637,13 +641,14 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 		var tiers []string
 		for _, tName := range []string{"Ultra", "Pro", "Free"} {
 			lim := m.Tiers[tName]
-			if lim.Requests > 0 && lim.Tokens > 0 {
+			if lim.Requests > 0 {
 				tiers = append(tiers, tName)
 			}
 		}
 		modelAcc[i] = AIStudioModelSummary{
 			ID:            m.ID,
 			Label:         m.Label,
+			Category:      strings.TrimSpace(m.Category),
 			EligibleTiers: tiers,
 		}
 	}
@@ -682,7 +687,7 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 
 		for mi, m := range qf.Models {
 			lim := m.Tiers[acc.tier]
-			if lim.Requests <= 0 || lim.Tokens <= 0 {
+			if lim.Requests <= 0 {
 				pubAcc.Models = append(pubAcc.Models, AIStudioAccountModel{
 					ModelID:     m.ID,
 					Status:      "ineligible",
@@ -691,11 +696,14 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 				continue
 			}
 
+			hasTokenLimit := lim.Tokens > 0
 			pubAcc.EligibleModelCnt++
 			ms := &modelAcc[mi]
 			ms.EligibleAccounts++
 			ms.LimitRequests += lim.Requests
-			ms.LimitTokens += lim.Tokens
+			if hasTokenLimit {
+				ms.LimitTokens += lim.Tokens
+			}
 
 			u := pairUsage[usageKey{accID: acc.publicID, modelID: m.ID}]
 			usedReq := u.Requests
@@ -707,9 +715,14 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 			if rawRemReq < 0 {
 				rawRemReq = 0
 			}
-			rawRemTok := lim.Tokens - usedTok
-			if rawRemTok < 0 {
-				rawRemTok = 0
+			var limitTok int64
+			var rawRemTok int64
+			if hasTokenLimit {
+				limitTok = lim.Tokens
+				rawRemTok = lim.Tokens - usedTok
+				if rawRemTok < 0 {
+					rawRemTok = 0
+				}
 			}
 
 			cdUntil := gCDMs
@@ -718,13 +731,13 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 			}
 
 			am := AIStudioAccountModel{
-				ModelID:        m.ID,
-				LimitRequests:  lim.Requests,
-				UsedRequests:   usedReq,
-				RawRemRequests: rawRemReq,
-				LimitTokens:    lim.Tokens,
-				UsedTokens:     usedTok,
-				RawRemTokens:   rawRemTok,
+				ModelID:         m.ID,
+				LimitRequests:   lim.Requests,
+				UsedRequests:    usedReq,
+				RawRemRequests:  rawRemReq,
+				LimitTokens:     limitTok,
+				UsedTokens:      usedTok,
+				RawRemTokens:    rawRemTok,
 				CooldownUntilMs: cdUntil,
 			}
 
@@ -764,7 +777,7 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 				am.EffectiveRemTokens = 0
 				am.EffectivePercent = 0
 				ms.ExhaustedAccounts++
-			case rawRemTok == 0:
+			case hasTokenLimit && rawRemTok == 0:
 				am.Status = "exhausted_tokens"
 				am.StatusLabel = "Token耗尽"
 				am.EffectiveRemReq = 0
@@ -775,14 +788,19 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 				am.Status = "available"
 				am.StatusLabel = "可用"
 				am.EffectiveRemReq = rawRemReq
-				am.EffectiveRemTokens = rawRemTok
 				reqPct := float64(rawRemReq) / float64(lim.Requests) * 100.0
-				tokPct := float64(rawRemTok) / float64(lim.Tokens) * 100.0
-				am.EffectivePercent = round2(math.Min(reqPct, tokPct))
+				if hasTokenLimit {
+					am.EffectiveRemTokens = rawRemTok
+					tokPct := float64(rawRemTok) / float64(lim.Tokens) * 100.0
+					am.EffectivePercent = round2(clampPercent(math.Min(reqPct, tokPct)))
+					ms.EffectiveRemTokens += rawRemTok
+				} else {
+					am.EffectiveRemTokens = 0
+					am.EffectivePercent = round2(clampPercent(reqPct))
+				}
 				pubAcc.AvailableModelCnt++
 				ms.AvailableAccounts++
 				ms.EffectiveRemReq += rawRemReq
-				ms.EffectiveRemTokens += rawRemTok
 			}
 
 			pubAcc.Models = append(pubAcc.Models, am)
@@ -794,10 +812,14 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 	// Finalize per-model effective bottleneck percent
 	for i := range modelAcc {
 		ms := &modelAcc[i]
-		if ms.LimitRequests > 0 && ms.LimitTokens > 0 && ms.AvailableAccounts > 0 {
+		if ms.LimitRequests > 0 && ms.AvailableAccounts > 0 {
 			reqPct := float64(ms.EffectiveRemReq) / float64(ms.LimitRequests) * 100.0
-			tokPct := float64(ms.EffectiveRemTokens) / float64(ms.LimitTokens) * 100.0
-			ms.EffectivePercent = round2(clampPercent(math.Min(reqPct, tokPct)))
+			if ms.LimitTokens > 0 {
+				tokPct := float64(ms.EffectiveRemTokens) / float64(ms.LimitTokens) * 100.0
+				ms.EffectivePercent = round2(clampPercent(math.Min(reqPct, tokPct)))
+			} else {
+				ms.EffectivePercent = round2(clampPercent(reqPct))
+			}
 		} else {
 			ms.EffectivePercent = 0
 		}
@@ -885,10 +907,91 @@ func toChannelSummary(s aisUsageStats, cooldownCnt int) AIStudioChannelSummary {
 	return cs
 }
 
-func normalizeModelID(m string) string {
+func resolveCooldownUntilMs(cd aisRawCooldown, now time.Time) int64 {
+	if !cd.Until.IsZero() {
+		if cd.Until.After(now) {
+			return cd.Until.UnixMilli()
+		}
+		return 0
+	}
+	if cd.RemainingSeconds > 0 {
+		return now.UnixMilli() + int64(math.Round(cd.RemainingSeconds*1000))
+	}
+	return 0
+}
+
+func cleanModelName(m string) string {
 	m = strings.TrimSpace(m)
-	m = strings.TrimPrefix(m, "models/")
+	if m == "" || m == "*" {
+		return m
+	}
+	if len(m) >= 7 && strings.EqualFold(m[:7], "models/") {
+		m = strings.TrimSpace(m[7:])
+	}
+	for {
+		prev := m
+		if strings.HasSuffix(m, ")") {
+			if idx := strings.LastIndex(m, "("); idx > 0 {
+				m = strings.TrimSpace(m[:idx])
+			}
+		}
+		if len(m) > len("-search") && strings.EqualFold(m[len(m)-len("-search"):], "-search") {
+			m = strings.TrimSpace(m[:len(m)-len("-search")])
+		}
+		if m == prev {
+			break
+		}
+	}
 	return m
+}
+
+func buildModelAliasMap(qf *QuotasFile) map[string]string {
+	aliasMap := map[string]string{}
+	if qf == nil {
+		return aliasMap
+	}
+	for _, m := range qf.Models {
+		canonical := strings.TrimSpace(m.ID)
+		if canonical == "" {
+			continue
+		}
+		aliasMap[strings.ToLower(canonical)] = canonical
+		if cleaned := strings.ToLower(cleanModelName(canonical)); cleaned != "" {
+			aliasMap[cleaned] = canonical
+		}
+	}
+	for _, m := range qf.Models {
+		canonical := strings.TrimSpace(m.ID)
+		if canonical == "" {
+			continue
+		}
+		for _, a := range m.Aliases {
+			for _, candidate := range []string{strings.ToLower(strings.TrimSpace(a)), strings.ToLower(cleanModelName(a))} {
+				if candidate == "" {
+					continue
+				}
+				if _, exists := aliasMap[candidate]; !exists {
+					aliasMap[candidate] = canonical
+				}
+			}
+		}
+	}
+	return aliasMap
+}
+
+func normalizeModelID(m string, aliasMap map[string]string) string {
+	rawTrim := strings.TrimSpace(m)
+	if rawTrim == "" || rawTrim == "*" {
+		return rawTrim
+	}
+	if canonical, ok := aliasMap[strings.ToLower(rawTrim)]; ok {
+		return canonical
+	}
+	cleaned := cleanModelName(rawTrim)
+	if canonical, ok := aliasMap[strings.ToLower(cleaned)]; ok {
+		return canonical
+	}
+	return cleaned
 }
 
 func aisAccountStateLabel(st string) string {

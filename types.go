@@ -214,6 +214,7 @@ type AIStudioChannelSummary struct {
 type AIStudioModelSummary struct {
 	ID                  string   `json:"id"`
 	Label               string   `json:"label"`
+	Category            string   `json:"category,omitempty"`
 	EligibleTiers       []string `json:"eligible_tiers"`
 	EligibleAccounts    int      `json:"eligible_accounts"`
 	AvailableAccounts   int      `json:"available_accounts"`

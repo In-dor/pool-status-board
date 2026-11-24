@@ -2,7 +2,7 @@
   "reset_timezone": "Asia/Shanghai",
   "reset_hour": 16,
   "reset_minute": 0,
-  "rule_note": "每日北京时间 16:00 重置；单账号单模型次数与 Token 任一耗尽即视为该账号该模型不可用（短板熔断）。",
+  "rule_note": "每日北京时间 16:00 重置；文本模型按单账号次数与 Token 短板熔断，画图模型按单账号次数计额。",
   "models": [
     {
       "id": "gemini-4-argon",
@@ -92,6 +92,56 @@
         "Free":  { "requests": 100, "tokens": 5000000 },
         "Pro":   { "requests": 100, "tokens": 11000000 },
         "Ultra": { "requests": 150, "tokens": 15000000 }
+      }
+    },
+    {
+      "id": "gemini-nano-banana-2.1",
+      "label": "Nano Banana 2.1",
+      "category": "image",
+      "aliases": ["nano-banana-2.1"],
+      "tiers": {
+        "Free":  { "requests": 0,   "tokens": 0 },
+        "Pro":   { "requests": 50,  "tokens": 0 },
+        "Ultra": { "requests": 150, "tokens": 0 }
+      }
+    },
+    {
+      "id": "gemini-3-pro-image",
+      "label": "Nano Banana Pro",
+      "category": "image",
+      "aliases": ["gemini-3-pro-image-preview", "nano-banana-pro"],
+      "tiers": {
+        "Free":  { "requests": 0,   "tokens": 0 },
+        "Pro":   { "requests": 50,  "tokens": 0 },
+        "Ultra": { "requests": 100, "tokens": 0 }
+      }
+    },
+    {
+      "id": "gemini-3.1-flash-image",
+      "label": "Nano Banana 2",
+      "category": "image",
+      "aliases": ["gemini-3.1-flash-image-preview", "nano-banana-2"],
+      "tiers": {
+        "Free":  { "requests": 0,   "tokens": 0 },
+        "Pro":   { "requests": 100, "tokens": 0 },
+        "Ultra": { "requests": 150, "tokens": 0 }
+      }
+    },
+    {
+      "id": "gemini-3.1-flash-lite-image",
+      "label": "Nano Banana 2 Lite",
+      "category": "image",
+      "aliases": [
+        "gemini-2.0-flash-exp",
+        "gemini-2.0-flash-exp-image-generation",
+        "gemini-2.0-flash-preview-image-generation",
+        "nano-banana",
+        "nano-banana-2-lite"
+      ],
+      "tiers": {
+        "Free":  { "requests": 100, "tokens": 0 },
+        "Pro":   { "requests": 100, "tokens": 0 },
+        "Ultra": { "requests": 150, "tokens": 0 }
       }
     }
   ]

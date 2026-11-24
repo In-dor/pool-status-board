@@ -7,7 +7,7 @@
 - **零上游推理消耗 & 严格脱敏**：后台定时只读采集并缓存内存快照，所有公开接口均不包含真实邮箱、凭证文件名、`auth_index`、`project_id`、Cookie 或任何密钥。
 - **CPAMP 同款近期健康条**：复用 `auth-files` 接口 20 × 10 分钟分桶数据（近 200 分钟），三色 RGB 线性插值胶囊条 + 整体成功率与时段详情。
 - **周期燃烧分析图（Cycle Burn Chart）**：内存增量缓存近 36 天 `lamplighter` 采样历史，支持 `5 小时 / 7 天` 窗口与多跨度切换、5 级健康色带时间轴、重置断线平滑曲线、匀速参考线、按当前速度延长线预测，以及桌面悬停与移动端全宽触控读数条。
-- **AIStudio2API 短板熔断核算**：按每日 16:00（北京时间）周期核算全部模型次数与 Token 双维度短板余量、冷却倒计时，并附带本轮分小时消耗趋势柱状图。
+- **AIStudio2API 双模式配额核算**：按每日 16:00（北京时间）周期核算全部模型（含 Gemini 文本模型与 Nano Banana 系列画图模型）配额余量与冷却倒计时，并附带本轮分小时消耗趋势柱状图；文本模型采用单账号次数与 Token 双维度短板熔断，画图模型（`tokens: 0`）采用单账号纯按次计额，同时支持模型别名与后缀自动归一化归并。
 - **可选口令门禁**：通过 `.env` 中的 `VIEW_PASSCODE` 保护 `/api/snapshot` 与 `/api/antigravity/history`（常量时间比对）。
 
 ## 项目结构
@@ -17,9 +17,9 @@ Pool-Status-Board/
 ├── main.go              # HTTP 服务、定时刷新、口令校验与 /api/snapshot、/api/antigravity/history 路由
 ├── types.go             # 严格脱敏的公开 API DTO 定义
 ├── cpa_collector.go     # Antigravity 凭证、lamplighter 36 天历史缓存与 CPAMP 统计采集器
-├── ais_collector.go     # AIStudio2API 账号、冷却、分时统计与短板熔断采集器
+├── ais_collector.go     # AIStudio2API 账号、冷却、别名归一化、分时统计与双模式配额采集器
 ├── sanitize.go          # 匿名代号排序、档位归一化与数值工具函数
-├── quotas.json          # AIStudio2API 各档位每日模型配额表（支持热重载）
+├── quotas.json          # AIStudio2API 各档位每日模型配额表（支持文本双维度 / 画图按次计额与热重载）
 ├── web/index.html       # 单文件零依赖响应式前端（浅/深色主题 + 内联 SVG 图表）
 ├── Dockerfile           # 多阶段静态编译镜像
 ├── docker-compose.yml   # 容器编排配置

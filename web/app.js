@@ -94,7 +94,7 @@
     themePref: ['system', 'light', 'dark'].includes(savedThemePref) ? savedThemePref : 'system',
     selectedModel: '',
     selectedTier: 'ALL',
-    aisModelGroup: 'ALL',     // ALL | USED | G4 | G3
+    aisModelGroup: 'ALL',     // ALL | USED | G4 | G3 | IMAGE
     aisModelSort: 'default',  // default | remaining_asc
     aisAccountSort: 'default', // default | usage | issues
     aisExpandAllFull: false,
@@ -2969,32 +2969,43 @@
   }
 
   // ---------- Render AIStudio2API Playground Section ----------
+  function isImageModel(m) {
+    return m.category === 'image'
+      || /(?:^|-)image$|^gemini-nano-banana|^imagen/i.test(m.id || '')
+      || /Nano\s*Banana/i.test(m.label || '');
+  }
+
   function isGemini4Model(m) {
+    if (isImageModel(m)) return false;
     return /^gemini-4/i.test(m.id || '') || /Gemini\s*4/i.test(m.label || '');
   }
 
   function computeModelDimensions(m) {
+    const hasTokenLimit = (m.limit_tokens || 0) > 0;
     const reqPct = m.limit_requests > 0
       ? Math.max(0, Math.min(100, (m.effective_remaining_requests / m.limit_requests) * 100))
-      : 100;
-    const tokPct = m.limit_tokens > 0
+      : 0;
+    const tokPct = hasTokenLimit
       ? Math.max(0, Math.min(100, (m.effective_remaining_tokens / m.limit_tokens) * 100))
-      : 100;
+      : null;
 
-    let bottleneck = 'balanced'; // 'tokens' | 'requests' | 'balanced' | 'none'
+    let bottleneck = 'balanced'; // 'tokens' | 'requests' | 'balanced' | 'requests_only' | 'none'
     if (m.eligible_accounts === 0) {
       bottleneck = 'none';
+    } else if (!hasTokenLimit) {
+      bottleneck = 'requests_only';
     } else if (m.used_requests > 0 || m.used_tokens > 0 || m.effective_percent < 100 - LEVEL_EPSILON) {
       if (Math.abs(reqPct - tokPct) >= 0.1) {
         bottleneck = tokPct < reqPct ? 'tokens' : 'requests';
       }
     }
-    return { reqPct, tokPct, bottleneck };
+    return { hasTokenLimit, reqPct, tokPct, bottleneck };
   }
 
   function bottleneckTagHTML(bottleneck) {
     if (bottleneck === 'tokens') return `<span class="bn-tag bn-tok">Token 短板</span>`;
     if (bottleneck === 'requests') return `<span class="bn-tag bn-req">次数短板</span>`;
+    if (bottleneck === 'requests_only') return `<span class="bn-tag bn-req-only">按次计额</span>`;
     if (bottleneck === 'balanced') return `<span class="bn-tag bn-bal">均衡</span>`;
     return `<span class="bn-tag bn-bal">无合格号</span>`;
   }
@@ -3194,16 +3205,22 @@
       </div>
     `;
 
-    // ---------- 10-Model Quota Matrix (Desktop Table + Mobile Zero-Horizontal-Scroll Cards) ----------
+    // ---------- Model Quota Matrix (Desktop Table + Mobile Zero-Horizontal-Scroll Cards) ----------
     const allModels = ais.models || [];
     const usedCnt = allModels.filter(m => m.used_requests > 0 || m.used_tokens > 0 || m.effective_percent < 100 - LEVEL_EPSILON).length;
     const g4Cnt = allModels.filter(isGemini4Model).length;
-    const g3Cnt = allModels.length - g4Cnt;
+    const imgCnt = allModels.filter(isImageModel).length;
+    const g3Cnt = allModels.filter(m => !isGemini4Model(m) && !isImageModel(m)).length;
+
+    if (state.aisModelGroup === 'IMAGE' && imgCnt === 0) {
+      state.aisModelGroup = 'ALL';
+    }
 
     let visibleModels = allModels.filter(m => {
       if (state.aisModelGroup === 'USED') return m.used_requests > 0 || m.used_tokens > 0 || m.effective_percent < 100 - LEVEL_EPSILON;
       if (state.aisModelGroup === 'G4') return isGemini4Model(m);
-      if (state.aisModelGroup === 'G3') return !isGemini4Model(m);
+      if (state.aisModelGroup === 'G3') return !isGemini4Model(m) && !isImageModel(m);
+      if (state.aisModelGroup === 'IMAGE') return isImageModel(m);
       return true;
     });
 
@@ -3244,6 +3261,31 @@
           const usedCls = m.used_requests > 0 ? 'has-usage' : '';
           const rowAccent = pctTextColor(m.effective_percent);
           const isEmpty = m.eligible_accounts > 0 && quotaLevel(m.effective_percent) === 'empty';
+          const reqBarCls = m.eligible_accounts === 0 ? 'bar-slate' : barColorClass(dims.reqPct);
+
+          const tokenCellHtml = dims.hasTokenLimit
+            ? `<div><strong>${fmtCompact(m.effective_remaining_tokens)}</strong> <span style="color:var(--text-3)">/ ${fmtCompact(m.limit_tokens)}</span></div>
+               <div class="mini-sub">已用 ${fmtCompact(m.used_tokens)}</div>`
+            : `<div class="token-unlimited-label">按次计额</div>
+               <div class="mini-sub">${(m.used_tokens || 0) > 0 ? `已耗 ${fmtCompact(m.used_tokens)}` : '无 Token 限额'}</div>`;
+
+          const dimBarsHtml = dims.hasTokenLimit
+            ? `<div class="dual-bars">
+                 <div class="dual-bar-item ${dims.bottleneck === 'requests' ? 'is-bottleneck' : ''}" title="次数剩余 ${fmtPct(dims.reqPct, 1)}">
+                   <div class="dual-bar-top num"><span>次数</span><span>${fmtPct(dims.reqPct, 1)}</span></div>
+                   <div class="bar-track bar-track-xs"><div class="bar-fill ${reqBarCls}" style="width:${dims.reqPct}%"></div></div>
+                 </div>
+                 <div class="dual-bar-item ${dims.bottleneck === 'tokens' ? 'is-bottleneck' : ''}" title="Token 剩余 ${fmtPct(dims.tokPct, 1)}">
+                   <div class="dual-bar-top num"><span>Token</span><span>${fmtPct(dims.tokPct, 1)}</span></div>
+                   <div class="bar-track bar-track-xs"><div class="bar-fill ${m.eligible_accounts === 0 ? 'bar-slate' : barColorClass(dims.tokPct)}" style="width:${dims.tokPct}%"></div></div>
+                 </div>
+               </div>`
+            : `<div class="dual-bars dual-bars-single">
+                 <div class="dual-bar-item" title="次数剩余 ${fmtPct(dims.reqPct, 1)}">
+                   <div class="dual-bar-top num"><span>次数余量</span><span>${fmtPct(dims.reqPct, 1)}</span></div>
+                   <div class="bar-track bar-track-xs"><div class="bar-fill ${reqBarCls}" style="width:${dims.reqPct}%"></div></div>
+                 </div>
+               </div>`;
 
           return `
             <tr class="clickable ${selCls} ${usedCls}" style="--row-accent:${rowAccent};" data-select-model="${esc(m.id)}">
@@ -3263,8 +3305,7 @@
                 <div class="mini-sub">已用 ${fmtInt(m.used_requests)}</div>
               </td>
               <td class="num">
-                <div><strong>${fmtCompact(m.effective_remaining_tokens)}</strong> <span style="color:var(--text-3)">/ ${fmtCompact(m.limit_tokens)}</span></div>
-                <div class="mini-sub">已用 ${fmtCompact(m.used_tokens)}</div>
+                ${tokenCellHtml}
               </td>
               <td class="prog-cell">
                 <div class="prog-row">
@@ -3273,16 +3314,7 @@
                   </div>
                   <div class="prog-pct num" style="color:${m.eligible_accounts === 0 ? 'var(--text-3)' : rowAccent}">${fmtPct(m.effective_percent, 1)}</div>
                 </div>
-                <div class="dual-bars">
-                  <div class="dual-bar-item ${dims.bottleneck === 'requests' ? 'is-bottleneck' : ''}" title="次数剩余 ${fmtPct(dims.reqPct, 1)}">
-                    <div class="dual-bar-top num"><span>次数</span><span>${fmtPct(dims.reqPct, 1)}</span></div>
-                    <div class="bar-track bar-track-xs"><div class="bar-fill ${barColorClass(dims.reqPct)}" style="width:${dims.reqPct}%"></div></div>
-                  </div>
-                  <div class="dual-bar-item ${dims.bottleneck === 'tokens' ? 'is-bottleneck' : ''}" title="Token 剩余 ${fmtPct(dims.tokPct, 1)}">
-                    <div class="dual-bar-top num"><span>Token</span><span>${fmtPct(dims.tokPct, 1)}</span></div>
-                    <div class="bar-track bar-track-xs"><div class="bar-fill ${barColorClass(dims.tokPct)}" style="width:${dims.tokPct}%"></div></div>
-                  </div>
-                </div>
+                ${dimBarsHtml}
                 <div class="bottleneck-meta">
                   ${bottleneckTagHTML(dims.bottleneck)}
                   <span>${recoveryHtml}</span>
@@ -3305,6 +3337,19 @@
           const usedCls = m.used_requests > 0 ? 'has-usage' : '';
           const rowAccent = pctTextColor(m.effective_percent);
           const isEmpty = m.eligible_accounts > 0 && quotaLevel(m.effective_percent) === 'empty';
+          const reqBarCls = m.eligible_accounts === 0 ? 'bar-slate' : barColorClass(dims.reqPct);
+
+          const mobileRightDimHtml = dims.hasTokenLimit
+            ? `<div class="m-dim-box">
+                 <div class="m-dim-head num"><span>Token 余量</span><span>${fmtPct(dims.tokPct, 1)}</span></div>
+                 <div class="m-dim-val num">${fmtCompact(m.effective_remaining_tokens)} <span style="font-weight:500;color:var(--text-3)">/ ${fmtCompact(m.limit_tokens)}</span></div>
+                 <div class="bar-track bar-track-xs"><div class="bar-fill ${m.eligible_accounts === 0 ? 'bar-slate' : barColorClass(dims.tokPct)}" style="width:${dims.tokPct}%"></div></div>
+               </div>`
+            : `<div class="m-dim-box">
+                 <div class="m-dim-head"><span>已耗 Token</span><span>不限额</span></div>
+                 <div class="m-dim-val num m-dim-val-muted">${(m.used_tokens || 0) > 0 ? fmtCompact(m.used_tokens) : '0'}</div>
+                 <div class="m-dim-note">按次计额，无 Token 上限</div>
+               </div>`;
 
           return `
             <div class="m-card ${selCls} ${usedCls}" style="--row-accent:${rowAccent};" data-select-model="${esc(m.id)}">
@@ -3329,13 +3374,9 @@
                 <div class="m-dim-box">
                   <div class="m-dim-head num"><span>次数余量</span><span>${fmtPct(dims.reqPct, 1)}</span></div>
                   <div class="m-dim-val num">${fmtInt(m.effective_remaining_requests)} <span style="font-weight:500;color:var(--text-3)">/ ${fmtInt(m.limit_requests)}</span></div>
-                  <div class="bar-track bar-track-xs"><div class="bar-fill ${barColorClass(dims.reqPct)}" style="width:${dims.reqPct}%"></div></div>
+                  <div class="bar-track bar-track-xs"><div class="bar-fill ${reqBarCls}" style="width:${dims.reqPct}%"></div></div>
                 </div>
-                <div class="m-dim-box">
-                  <div class="m-dim-head num"><span>Token 余量</span><span>${fmtPct(dims.tokPct, 1)}</span></div>
-                  <div class="m-dim-val num">${fmtCompact(m.effective_remaining_tokens)} <span style="font-weight:500;color:var(--text-3)">/ ${fmtCompact(m.limit_tokens)}</span></div>
-                  <div class="bar-track bar-track-xs"><div class="bar-fill ${barColorClass(dims.tokPct)}" style="width:${dims.tokPct}%"></div></div>
-                </div>
+                ${mobileRightDimHtml}
               </div>
             </div>
           `;
@@ -3347,12 +3388,15 @@
       { key: 'G4', label: 'Gemini 4', cnt: g4Cnt },
       { key: 'G3', label: '3.x 系列', cnt: g3Cnt },
     ];
+    if (imgCnt > 0) {
+      groupDefs.push({ key: 'IMAGE', label: 'Nano Banana', cnt: imgCnt });
+    }
 
     const tableCard = `
       <div class="card">
         <div class="card-header">
           <div>
-            <div class="card-title">Playground 全部 ${allModels.length} 个模型配额矩阵（双维度短板熔断）</div>
+            <div class="card-title">Playground 全部 ${allModels.length} 个模型配额矩阵${imgCnt > 0 ? '（文本双维度 · 画图按次）' : '（双维度短板熔断）'}</div>
             <div class="card-note">${esc(ais.reset_rule_note)} · 点击模型行或卡片聚焦下方单号明细</div>
           </div>
           ${focusPillHtml}
@@ -3381,7 +3425,7 @@
                 <th>可用 / 合格号</th>
                 <th>剩余次数 / 总额</th>
                 <th>剩余 Token / 总额</th>
-                <th>综合有效剩余 &amp; 次数 / Token 短板</th>
+                <th>综合有效剩余 &amp; 计额维度</th>
               </tr>
             </thead>
             <tbody>${desktopRowsHtml}</tbody>
@@ -3755,11 +3799,12 @@
   }
 
   function isAccountModelFullZero(m) {
+    const hasTokenLimit = (m.limit_tokens || 0) > 0;
     return (
       m.status === 'available' &&
       m.effective_percent >= 100 - LEVEL_EPSILON &&
       !(m.used_requests > 0) &&
-      !(m.used_tokens > 0)
+      (!hasTokenLimit || !(m.used_tokens > 0))
     );
   }
 
@@ -3868,6 +3913,10 @@
         </div>`;
       } else {
         const isEmpty = quotaLevel(m.effective_percent) === 'empty';
+        const hasTokenLimit = (m.limit_tokens || 0) > 0;
+        const focusTokenSpan = hasTokenLimit
+          ? `<span>Token ${fmtCompact(m.effective_remaining_tokens)} / ${fmtCompact(m.limit_tokens)}</span>`
+          : `<span style="color:var(--text-3);">${(m.used_tokens || 0) > 0 ? `按次计额 · 已耗 ${fmtCompact(m.used_tokens)} tok` : '按次计额'}</span>`;
         const cdLine = m.cooldown_until_ms && m.status === 'cooldown'
           ? `<div style="font-size:11.5px;color:var(--amber-text)">冷却恢复：<span class="cd-target num" data-ts="${m.cooldown_until_ms}" data-suffix="后恢复">${fmtCountdown(m.cooldown_until_ms, '后恢复')}</span></div>`
           : '';
@@ -3885,7 +3934,7 @@
             </div>
             <div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--text-2);flex-wrap:wrap;gap:4px;" class="num">
               <span>次数 ${fmtInt(m.effective_remaining_requests)} / ${fmtInt(m.limit_requests)}（已用 ${fmtInt(m.used_requests)}）</span>
-              <span>Token ${fmtCompact(m.effective_remaining_tokens)} / ${fmtCompact(m.limit_tokens)}</span>
+              ${focusTokenSpan}
             </div>
             ${cdLine}
           </div>
@@ -3921,10 +3970,20 @@
           rightCol = `<span class="badge ${statusBadgeClass(m.status)}" style="font-size:10px;padding:1px 6px;">${esc(m.status_label)}</span>`;
         }
 
+        const hasTokenLimit = (m.limit_tokens || 0) > 0;
+        const rowTitle = hasTokenLimit
+          ? `${friendly} (${m.model_id}): 剩余次数 ${m.effective_remaining_requests}/${m.limit_requests}, 剩余 Token ${fmtCompact(m.effective_remaining_tokens)}/${fmtCompact(m.limit_tokens)}`
+          : `${friendly} (${m.model_id}): 剩余次数 ${m.effective_remaining_requests}/${m.limit_requests}（按次计额${(m.used_tokens || 0) > 0 ? `，已耗 ${fmtCompact(m.used_tokens)} tok` : ''}）`;
+        const rowNums = hasTokenLimit
+          ? `${fmtInt(m.effective_remaining_requests)}次 · ${fmtCompact(m.effective_remaining_tokens)}`
+          : ((m.used_tokens || 0) > 0
+              ? `${fmtInt(m.effective_remaining_requests)}次 · 已耗 ${fmtCompact(m.used_tokens)} tok`
+              : `${fmtInt(m.effective_remaining_requests)}/${fmtInt(m.limit_requests)}次`);
+
         return `
-          <div class="ais-m-row" title="${esc(friendly)} (${esc(m.model_id)}): 剩余次数 ${m.effective_remaining_requests}/${m.limit_requests}, 剩余 Token ${fmtCompact(m.effective_remaining_tokens)}/${fmtCompact(m.limit_tokens)}">
+          <div class="ais-m-row" title="${esc(rowTitle)}">
             <div class="ais-m-name">${esc(friendly)}</div>
-            <div class="ais-m-nums num">${fmtInt(m.effective_remaining_requests)}次 · ${fmtCompact(m.effective_remaining_tokens)}</div>
+            <div class="ais-m-nums num">${rowNums}</div>
             <div style="text-align:right;">${rightCol}</div>
           </div>
         `;

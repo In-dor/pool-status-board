@@ -1870,7 +1870,7 @@ button, select, input, a {
 }
 
 /* =========================================================
-   AIStudio2API — 10-Model Quota Matrix (Desktop + Mobile Cards)
+   AIStudio2API — Model Quota Matrix (Desktop + Mobile Cards)
    ========================================================= */
 .card {
   overflow: hidden;
@@ -2042,6 +2042,11 @@ button, select, input, a {
   color: var(--text-3);
   margin-top: 2px;
 }
+.token-unlimited-label {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-3);
+}
 
 .prog-cell { min-width: 225px; }
 .prog-row {
@@ -2062,6 +2067,9 @@ button, select, input, a {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   margin-top: 6px;
+}
+.dual-bars.dual-bars-single {
+  grid-template-columns: 1fr;
 }
 .dual-bar-item {
   display: flex;
@@ -2099,6 +2107,7 @@ button, select, input, a {
 }
 .bn-tag.bn-tok { background: var(--purple-bg); color: var(--purple-text); }
 .bn-tag.bn-req { background: var(--q-medium-bg); color: var(--q-medium); }
+.bn-tag.bn-req-only { background: var(--slate-bg); color: var(--text-2); font-weight: 600; }
 .bn-tag.bn-bal { background: var(--slate-bg); color: var(--text-3); font-weight: 600; }
 
 /* Mobile Zero-Horizontal-Scroll Model Cards (<768px) */
@@ -2171,6 +2180,15 @@ button, select, input, a {
   font-size: 12px;
   font-weight: 700;
   color: var(--text);
+}
+.m-dim-val.m-dim-val-muted {
+  color: var(--text-2);
+  font-weight: 600;
+}
+.m-dim-note {
+  font-size: 10.5px;
+  color: var(--text-3);
+  line-height: 1.3;
 }
 
 /* =========================================================
@@ -2432,6 +2450,9 @@ button, select, input, a {
   .cpamp-block { height: 11px; border-radius: 3px; }
 
   .ais-trend-card { padding: 11px 10px 10px; }
+  .matrix-toolbar { padding: 9px 12px; gap: 7px 10px; }
+  .matrix-filters { gap: 5px; }
+  .filter-pill { height: 26px; padding: 0 9px; font-size: 11.5px; gap: 4px; }
   .ais-acc-grid { grid-template-columns: 1fr; }
   .ais-m-row { grid-template-columns: minmax(0, 1.15fr) auto minmax(74px, 0.8fr); gap: 6px; padding: 5px 7px; }
 }
