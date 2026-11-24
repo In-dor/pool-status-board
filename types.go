@@ -100,10 +100,14 @@ type AntigravityWindow struct {
 	CurrentRequests  int64    `json:"current_requests"`
 	CurrentTokens    int64    `json:"current_tokens"`
 	CurrentCost      float64  `json:"current_cost"`
-	HasForecast      bool     `json:"has_forecast"`
-	ForecastBasis    string   `json:"forecast_basis,omitempty"` // quota | previous
-	ForecastTokens   int64    `json:"forecast_tokens"`
-	ForecastCost     float64  `json:"forecast_cost"`
+	HasForecast               bool     `json:"has_forecast"`
+	ForecastBasis             string   `json:"forecast_basis,omitempty"` // quota | previous
+	ForecastTokens            int64    `json:"forecast_tokens"`
+	ForecastCost              float64  `json:"forecast_cost"`
+	PostSampleCostUSD         float64  `json:"post_sample_cost_usd,omitempty"`
+	PostSampleTokens          int64    `json:"post_sample_tokens,omitempty"`
+	PostSampleRequests        int64    `json:"post_sample_requests,omitempty"`
+	EstimatedRemainingPercent *float64 `json:"estimated_remaining_percent,omitempty"`
 }
 
 type AntigravityTrendSeries struct {
@@ -137,9 +141,11 @@ type AntigravityHistorySeries struct {
 	ResetSec        int64        `json:"reset_sec"`     // effective reset sec; 0 when unopened full window
 	RawResetSec     int64        `json:"raw_reset_sec"` // raw reset sec from state/history
 	ObservedSec     int64        `json:"observed_sec"`
-	Points          [][2]float64 `json:"points"`                 // [[t_sec, remaining], ...]
-	Resets          [][2]int64   `json:"resets"`                 // [[t_sec, effective_reset_sec], ...]
-	CycleResets     []int64      `json:"cycle_resets,omitempty"` // sample timestamps (t_sec) where real cycle resets occur
+	Points             [][2]float64 `json:"points"`                         // [[t_sec, remaining], ...]
+	Resets             [][2]int64   `json:"resets"`                         // [[t_sec, effective_reset_sec], ...]
+	CycleResets        []int64      `json:"cycle_resets,omitempty"`         // sample timestamps (t_sec) where real cycle resets occur
+	EstimatedPoint     []float64    `json:"estimated_point,omitempty"`      // [now_sec, est_remaining] post-sample estimate/hold; never mixed into Points
+	PostSampleRequests *int64       `json:"post_sample_requests,omitempty"` // non-nil when CPAMP confirmed post-sample activity (0 = confirmed idle)
 }
 
 // ---------- AIStudio2API ----------

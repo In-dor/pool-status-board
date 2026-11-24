@@ -37,8 +37,14 @@ type AppConfig struct {
 	QuotasFile             string
 }
 
+const (
+	defaultRefreshIntervalSeconds = 15
+	freshMinGapDuration           = 4 * time.Second
+	fileWatchInterval             = 2 * time.Second
+)
+
 func loadConfig() AppConfig {
-	interval := 60
+	interval := defaultRefreshIntervalSeconds
 	if raw := strings.TrimSpace(os.Getenv("REFRESH_INTERVAL_SECONDS")); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n >= 15 && n <= 3600 {
 			interval = n
@@ -92,6 +98,116 @@ func (b *BoardState) GetJSON() []byte {
 	return b.snapshotJSON
 }
 
+// RefreshCoordinator serializes snapshot collections (singleflight), supports
+// mid-flight rerun coalescing for file-change triggers (e.g., lamplighter state.json),
+// and enforces a minimum debounce interval for on-demand ?fresh=1 requests.
+type RefreshCoordinator struct {
+	mu             sync.Mutex
+	inFlight       bool
+	pendingRerun   bool
+	doneCh         chan struct{}
+	lastFinishedAt time.Time
+	minFreshGap    time.Duration
+	nowFn          func() time.Time
+	collectFn      func(ctx context.Context)
+}
+
+func NewRefreshCoordinator(minFreshGap time.Duration, collectFn func(ctx context.Context)) *RefreshCoordinator {
+	return &RefreshCoordinator{
+		minFreshGap: minFreshGap,
+		nowFn:       time.Now,
+		collectFn:   collectFn,
+	}
+}
+
+func (rc *RefreshCoordinator) launchLocked(parentCtx context.Context) chan struct{} {
+	rc.inFlight = true
+	ch := make(chan struct{})
+	rc.doneCh = ch
+	go func() {
+		rc.collectFn(parentCtx)
+		rc.mu.Lock()
+		rc.lastFinishedAt = rc.nowFn()
+		close(ch)
+		if rc.pendingRerun && parentCtx.Err() == nil {
+			rc.pendingRerun = false
+			rc.launchLocked(parentCtx)
+			rc.mu.Unlock()
+			return
+		}
+		rc.inFlight = false
+		rc.doneCh = nil
+		rc.mu.Unlock()
+	}()
+	return ch
+}
+
+// RunBlocking executes (or joins) one collection synchronously and waits until it finishes.
+func (rc *RefreshCoordinator) RunBlocking(ctx context.Context) {
+	rc.mu.Lock()
+	var ch chan struct{}
+	if rc.inFlight {
+		ch = rc.doneCh
+	} else {
+		ch = rc.launchLocked(ctx)
+	}
+	rc.mu.Unlock()
+
+	select {
+	case <-ch:
+	case <-ctx.Done():
+	}
+}
+
+// TriggerBackground starts an asynchronous collection if idle.
+// If rerunIfInFlight is true and a collection is already running, one follow-up
+// collection is coalesced immediately after the current one completes.
+func (rc *RefreshCoordinator) TriggerBackground(parentCtx context.Context, rerunIfInFlight bool) {
+	if parentCtx.Err() != nil {
+		return
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if rc.inFlight {
+		if rerunIfInFlight {
+			rc.pendingRerun = true
+		}
+		return
+	}
+	rc.launchLocked(parentCtx)
+}
+
+// RefreshIfStale serves ?fresh=1 requests:
+// - If a collection is currently in flight, waits for it to finish (singleflight).
+// - If the last collection completed < minFreshGap ago, returns false immediately (debounced).
+// - Otherwise starts a new collection and waits for completion (respecting waitCtx).
+func (rc *RefreshCoordinator) RefreshIfStale(waitCtx, parentCtx context.Context) bool {
+	rc.mu.Lock()
+	if rc.inFlight {
+		ch := rc.doneCh
+		rc.mu.Unlock()
+		select {
+		case <-ch:
+			return true
+		case <-waitCtx.Done():
+			return false
+		}
+	}
+	if !rc.lastFinishedAt.IsZero() && rc.nowFn().Sub(rc.lastFinishedAt) < rc.minFreshGap {
+		rc.mu.Unlock()
+		return false
+	}
+	ch := rc.launchLocked(parentCtx)
+	rc.mu.Unlock()
+
+	select {
+	case <-ch:
+		return true
+	case <-waitCtx.Done():
+		return false
+	}
+}
+
 func main() {
 	cfg := loadConfig()
 
@@ -104,8 +220,9 @@ func main() {
 		AdminKeyEnv:      cfg.CPAMPAdminKeyEnv,
 		AdminKeyFile:     cfg.CPAMPAdminKeyFile,
 	})
-	// Prime secret file mtime tracker
+	// Prime mtime/size trackers for secret key and lamplighter state.json
 	cpa.CheckSecretKeyChanged()
+	cpa.CheckLamplighterStateChanged()
 
 	ais := NewAISCollector(AISConfig{
 		BaseURL:    cfg.AISBaseURL,
@@ -114,7 +231,6 @@ func main() {
 	})
 
 	state := &BoardState{}
-	refreshTrigger := make(chan struct{}, 1)
 
 	runRefresh := func(parentCtx context.Context) {
 		ctx, cancel := context.WithTimeout(parentCtx, 25*time.Second)
@@ -144,15 +260,17 @@ func main() {
 		state.Set(snap)
 	}
 
+	coordinator := NewRefreshCoordinator(freshMinGapDuration, runRefresh)
+
 	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	// Initial synchronous collection before serving traffic (with bounded timeout)
 	log.Printf("[board] starting initial snapshot collection...")
-	runRefresh(rootCtx)
+	coordinator.RunBlocking(rootCtx)
 	log.Printf("[board] initial snapshot ready")
 
-	// Periodic refresh + secret hot-reload worker
+	// Periodic background refresh worker (default 15s)
 	go func() {
 		ticker := time.NewTicker(time.Duration(cfg.RefreshIntervalSeconds) * time.Second)
 		defer ticker.Stop()
@@ -161,17 +279,14 @@ func main() {
 			case <-rootCtx.Done():
 				return
 			case <-ticker.C:
-				runRefresh(rootCtx)
-			case <-refreshTrigger:
-				log.Printf("[board] secret key update detected, refreshing snapshot immediately")
-				runRefresh(rootCtx)
+				coordinator.TriggerBackground(rootCtx, false)
 			}
 		}
 	}()
 
-	// Lightweight 3s mtime watcher for CPAMP admin key file
+	// Lightweight 2s read-only os.Stat watcher for CPAMP admin key & lamplighter state.json
 	go func() {
-		ticker := time.NewTicker(3 * time.Second)
+		ticker := time.NewTicker(fileWatchInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -179,10 +294,12 @@ func main() {
 				return
 			case <-ticker.C:
 				if cpa.CheckSecretKeyChanged() {
-					select {
-					case refreshTrigger <- struct{}{}:
-					default:
-					}
+					log.Printf("[board] secret key update detected, refreshing snapshot immediately")
+					coordinator.TriggerBackground(rootCtx, true)
+				}
+				if cpa.CheckLamplighterStateChanged() {
+					log.Printf("[board] lamplighter state.json update detected, refreshing snapshot immediately")
+					coordinator.TriggerBackground(rootCtx, true)
 				}
 			}
 		}
@@ -223,6 +340,10 @@ func main() {
 		w.Header().Set("Cache-Control", "no-store")
 		if !checkPasscode(w, r) {
 			return
+		}
+		freshParam := strings.TrimSpace(r.URL.Query().Get("fresh"))
+		if freshParam == "1" || strings.EqualFold(freshParam, "true") {
+			coordinator.RefreshIfStale(r.Context(), rootCtx)
 		}
 		payload := state.GetJSON()
 		if len(payload) == 0 {
@@ -276,7 +397,7 @@ func main() {
 		Addr:              cfg.ListenAddr,
 		Handler:           securityHeaders(mux),
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      15 * time.Second,
+		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 

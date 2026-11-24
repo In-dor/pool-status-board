@@ -763,6 +763,21 @@ button, select, input, a {
   border-radius: 999px;
   transition: width 0.35s cubic-bezier(0.22, 1, 0.36, 1);
 }
+.bar-fill-delta {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 0 999px 999px 0;
+  background: repeating-linear-gradient(
+    -45deg,
+    color-mix(in srgb, var(--accent) 42%, transparent),
+    color-mix(in srgb, var(--accent) 42%, transparent) 3px,
+    color-mix(in srgb, var(--accent) 18%, transparent) 3px,
+    color-mix(in srgb, var(--accent) 18%, transparent) 6px
+  );
+  transition: left 0.35s cubic-bezier(0.22, 1, 0.36, 1), width 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+  pointer-events: none;
+}
 .bar-full { background: var(--q-full-grad); }
 .bar-high { background: var(--q-high-grad); }
 .bar-medium { background: var(--q-medium-grad); }
@@ -1046,8 +1061,9 @@ button, select, input, a {
 .win-title-group {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   min-width: 0;
+  flex-wrap: wrap;
 }
 .win-dot {
   width: 9px;
@@ -1059,6 +1075,17 @@ button, select, input, a {
   font-size: 13.5px;
   font-weight: 700;
   color: var(--text);
+}
+.win-sample-age {
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--text-3);
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+  padding: 1px 6px;
+  border-radius: 999px;
+  white-space: nowrap;
+  line-height: 1.4;
 }
 .win-reset-pill {
   display: inline-flex;
@@ -1072,19 +1099,41 @@ button, select, input, a {
   font-weight: 600;
   color: var(--text-2);
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .win-main-metric {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px 10px;
+  flex-wrap: wrap;
+}
+.win-pct-group {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 .win-pct-big {
   font-size: 24px;
   font-weight: 800;
   letter-spacing: -0.03em;
   line-height: 1.1;
+}
+.win-est-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1.5px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 650;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  white-space: nowrap;
+  line-height: 1.35;
 }
 .win-req-tag {
   font-size: 12px;

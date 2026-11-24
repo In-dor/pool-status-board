@@ -1,7 +1,7 @@
 (() => {
   'use strict';
 
-  const POLL_SECONDS = 30;
+  const DEFAULT_POLL_SECONDS = 15;
   const STORAGE_THEME_PREF = 'psb_theme_pref';
   const STORAGE_VIEW = 'psb_view_mode';
   const STORAGE_PASS = 'psb_view_passcode';
@@ -87,9 +87,9 @@
 
   const savedThemePref = safeStorageGet(STORAGE_THEME_PREF, 'system');
   const state = {
-    meta: { passcode_required: false, refresh_interval_seconds: 60 },
+    meta: { passcode_required: false, refresh_interval_seconds: DEFAULT_POLL_SECONDS },
     snapshot: null,
-    countdown: POLL_SECONDS,
+    countdown: DEFAULT_POLL_SECONDS,
     viewMode: safeStorageGet(STORAGE_VIEW, 'full') === 'summary' ? 'summary' : 'full',
     themePref: ['system', 'light', 'dark'].includes(savedThemePref) ? savedThemePref : 'system',
     selectedModel: '',
@@ -391,6 +391,24 @@
     return `${pad2(p.M)}-${pad2(p.D)} ${pad2(p.h)}:${pad2(p.m)}`;
   }
 
+  function pollIntervalSeconds() {
+    const raw = Number(state.snapshot?.refresh_interval_seconds || state.meta?.refresh_interval_seconds || DEFAULT_POLL_SECONDS);
+    if (!Number.isFinite(raw) || raw < 5) return DEFAULT_POLL_SECONDS;
+    return Math.min(3600, Math.round(raw));
+  }
+
+  function fmtSampleAge(observedMs) {
+    if (!observedMs || observedMs <= 0) return '';
+    const diffSec = Math.max(0, Math.floor((Date.now() - observedMs) / 1000));
+    if (diffSec < 60) return '刚刚采样';
+    const mins = Math.floor(diffSec / 60);
+    if (mins < 60) return `采样 ${mins}m 前`;
+    const h = Math.floor(mins / 60);
+    const rm = mins % 60;
+    if (h < 24) return rm > 0 ? `采样 ${h}h${rm}m 前` : `采样 ${h}h 前`;
+    return `采样 ${Math.floor(h / 24)}d 前`;
+  }
+
   function fmtCompactCountdown(targetMs) {
     if (!targetMs || targetMs <= 0) return '—';
     const diffMs = targetMs - Date.now();
@@ -614,17 +632,19 @@
       return;
     }
     const clock = fmtClock(state.snapshot.generated_at_ms);
+    const interval = pollIntervalSeconds();
     el.textContent = `${clock} · ${state.countdown}s`;
-    el.setAttribute('title', `快照同步于 ${clock} · 约 ${state.countdown} 秒后静默刷新`);
+    el.setAttribute('title', `快照同步于 ${clock} · 每 ${interval} 秒静默刷新（约 ${state.countdown} 秒后）`);
   }
 
-  async function fetchSnapshot(manual = false) {
+  async function fetchSnapshot(manual = false, fresh = false) {
     if (state.fetching) return { ok: false, status: 0 };
     state.fetching = true;
     if (manual) setRefreshSpinning(true);
 
     try {
-      const resp = await fetch('/api/snapshot', { headers: authHeaders(), cache: 'no-store' });
+      const url = fresh ? '/api/snapshot?fresh=1' : '/api/snapshot';
+      const resp = await fetch(url, { headers: authHeaders(), cache: 'no-store' });
       if (resp.status === 401) {
         const hadSaved = !!safeStorageGet(STORAGE_PASS, '');
         if (!manual && hadSaved) {
@@ -641,7 +661,10 @@
       const nextSnap = await resp.json();
       const prevTs = state.snapshot ? state.snapshot.generated_at_ms : 0;
       state.snapshot = nextSnap;
-      state.countdown = POLL_SECONDS;
+      if (nextSnap.refresh_interval_seconds > 0) {
+        state.meta.refresh_interval_seconds = nextSnap.refresh_interval_seconds;
+      }
+      state.countdown = pollIntervalSeconds();
 
       // Build model friendly name lookup map
       modelLabelMap = new Map();
@@ -651,20 +674,28 @@
 
       if (state.gateOpen) showShell();
 
-      // Flicker-free silent polling: skip DOM rebuild when snapshot timestamp hasn't changed on background poll
-      const shouldRenderDOM = manual || !prevTs || prevTs !== nextSnap.generated_at_ms;
+      // Flicker-free silent polling + synchronized left/right history updates:
+      // Whenever snapshot timestamp changes (or manual refresh), force-sync visible histories
+      // so left quota cards and right burn chart update in lockstep with zero tear.
+      const snapChanged = !prevTs || prevTs !== nextSnap.generated_at_ms;
+      const shouldRenderDOM = manual || snapChanged;
       if (shouldRenderDOM) {
+        if (prevTs > 0) {
+          await refreshVisibleHistories(true, { skipRender: true });
+        }
         const savedScrollY = window.scrollY;
         render();
         if (Math.abs(window.scrollY - savedScrollY) > 2) {
           window.scrollTo(0, savedScrollY);
+        }
+        if (!prevTs) {
+          refreshVisibleHistories(true);
         }
       } else {
         renderTopBadges();
       }
 
       if (manual) flashJustSynced();
-      refreshVisibleHistories(manual);
       return { ok: true, status: 200 };
     } catch {
       if (!state.snapshot && !state.gateOpen) {
@@ -681,14 +712,15 @@
     }
   }
 
-  async function fetchAccountHistory(accId, win, range, force = false) {
+  async function fetchAccountHistory(accId, win, range, force = false, opts = {}) {
     const key = historyCacheKey(accId, win, range);
     const cached = state.historyCache.get(key);
     const now = Date.now();
-    if (!force && cached && cached.data && now - cached.fetchedAt < 55_000) {
+    const ttlMs = Math.max(10_000, (pollIntervalSeconds() - 1) * 1000);
+    if (!force && cached && cached.data && now - cached.fetchedAt < ttlMs) {
       return cached.data;
     }
-    if (cached && cached.loading) return cached.data || null;
+    if (!force && cached && cached.loading) return cached.data || null;
 
     state.historyCache.set(key, {
       data: cached?.data || null,
@@ -711,7 +743,7 @@
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       const data = await resp.json();
       state.historyCache.set(key, { data, fetchedAt: Date.now(), loading: false, error: null });
-      renderAccountHistoryPanel(accId);
+      if (!opts.skipRender) renderAccountHistoryPanel(accId);
       return data;
     } catch {
       state.historyCache.set(key, {
@@ -720,21 +752,23 @@
         loading: false,
         error: '历史数据暂不可用',
       });
-      renderAccountHistoryPanel(accId);
+      if (!opts.skipRender) renderAccountHistoryPanel(accId);
       return null;
     }
   }
 
-  function refreshVisibleHistories(force = false) {
+  async function refreshVisibleHistories(force = false, opts = {}) {
     const ag = state.snapshot?.antigravity;
     if (!ag || !ag.accounts) return;
     const isSingle = ag.accounts.length === 1;
+    const jobs = [];
     for (const acc of ag.accounts) {
       if (!acc.has_history) continue;
       if (!isSingle && state.collapsedTrends.has(acc.id)) continue;
       const pref = getChartPref(acc.id);
-      fetchAccountHistory(acc.id, pref.window, currentRangeOf(pref), force);
+      jobs.push(fetchAccountHistory(acc.id, pref.window, currentRangeOf(pref), force, opts));
     }
+    if (jobs.length) await Promise.allSettled(jobs);
   }
 
   // ---------- Top Bar Badges ----------
@@ -793,9 +827,21 @@
       const pct = Math.max(0, Math.min(100, w.remaining_percent));
       const isEmpty = quotaLevel(w.remaining_percent) === 'empty';
       const dotCol = windowDotColor(w);
+      const obsTag = w.observed_at_ms > 0
+        ? `<span class="win-sample-age age-target num" data-obs-ts="${w.observed_at_ms}" title="官方采样时刻: ${esc(fmtDateTime(w.observed_at_ms))}">${esc(fmtSampleAge(w.observed_at_ms))}</span>`
+        : '';
       const resetHtml = w.stale
         ? `<span class="win-reset-pill">等待采样</span>`
         : `<span class="win-reset-pill" title="重置时刻: ${esc(fmtDateTime(w.reset_at_ms))}">↻ <span class="cd-target num" data-ts="${w.reset_at_ms}" data-compact="1">${esc(fmtCompactCountdown(w.reset_at_ms))}</span></span>`;
+
+      const estRem = (w.estimated_remaining_percent != null && Number.isFinite(w.estimated_remaining_percent))
+        ? Math.max(0, Math.min(pct, w.estimated_remaining_percent))
+        : null;
+      const estDelta = estRem != null ? (pct - estRem) : 0;
+      const showLiveEst = estRem != null && estDelta >= 0.25;
+      const estChip = showLiveEst
+        ? `<span class="win-est-chip num" title="采样后新增 ${fmtInt(w.post_sample_requests || 0)} 次请求（${fmtCost(w.post_sample_cost_usd || 0)} · ${fmtCompact(w.post_sample_tokens || 0)}），实时估算余量约 ${fmtPct(estRem, 1)}">实时估算 ~${fmtPct(estRem, 1)}</span>`
+        : '';
 
       const reqBadge = w.current_requests > 0
         ? `<span class="win-req-tag num">${fmtInt(w.current_requests)} 次请求</span>`
@@ -810,21 +856,30 @@
         usageParts.push(`<span class="win-foot-forecast num">${tag} <strong>${fmtCost(w.forecast_cost)}</strong> · ${fmtCompact(w.forecast_tokens)}</span>`);
       }
 
+      const barInnerHtml = showLiveEst
+        ? `<div class="bar-fill ${barColorClass(estRem)}" style="width:${estRem.toFixed(2)}%"></div>
+           <div class="bar-fill-delta" style="left:${estRem.toFixed(2)}%;width:${estDelta.toFixed(2)}%" title="采样后实时估算消耗约 ${estDelta.toFixed(1)}%"></div>`
+        : `<div class="bar-fill ${barColorClass(w.remaining_percent)}" style="width:${pct}%"></div>`;
+
       return `
         <div class="win-active-card">
           <div class="win-top">
             <div class="win-title-group">
               <span class="win-dot" style="background:${dotCol}"></span>
               <span class="win-title">${esc(w.label)}</span>
+              ${obsTag}
             </div>
             ${resetHtml}
           </div>
           <div class="win-main-metric">
-            <span class="win-pct-big num" style="color:${pctTextColor(w.remaining_percent)}">${fmtPct(w.remaining_percent, 2)}</span>
+            <div class="win-pct-group">
+              <span class="win-pct-big num" style="color:${pctTextColor(w.remaining_percent)}">${fmtPct(w.remaining_percent, 2)}</span>
+              ${estChip}
+            </div>
             ${reqBadge}
           </div>
           <div class="bar-track ${isEmpty ? 'is-empty' : ''}">
-            <div class="bar-fill ${barColorClass(w.remaining_percent)}" style="width:${pct}%"></div>
+            ${barInnerHtml}
           </div>
           ${usageParts.length ? `<div class="win-foot-grid">${usageParts.join('')}</div>` : ''}
         </div>
@@ -1537,7 +1592,7 @@
     return { slope, error };
   }
 
-  function recentSlope(pts) {
+  function recentSlope(pts, minSpanSec = 900) {
     if (pts.length < 2) return 0;
     const pieces = [];
     for (let i = 0; i + 1 < pts.length; i++) pieces.push([i, i + 1]);
@@ -1554,7 +1609,40 @@
       if (best > 0) costs[best - 1] = cost(best - 1);
     }
     const last = pieces[pieces.length - 1];
-    return lineFit(pts, last[0], last[1]).slope;
+    let a = last[0];
+    const b = last[1];
+    const totalSpan = pts[pts.length - 1][0] - pts[0][0];
+    const reqSpan = Math.min(minSpanSec, Math.max(0, totalSpan));
+    while (a > 0 && (pts[b][0] - pts[a][0]) < reqSpan) {
+      a--;
+    }
+    return lineFit(pts, a, b).slope;
+  }
+
+  function interpAtTime(pts, t) {
+    if (!pts.length) return null;
+    if (t <= pts[0][0]) return pts[0][1];
+    const last = pts[pts.length - 1];
+    if (t >= last[0]) return last[1];
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const p0 = pts[i], p1 = pts[i + 1];
+      if (t >= p0[0] && t <= p1[0]) {
+        const dt = p1[0] - p0[0];
+        if (!(dt > 0)) return p1[1];
+        return p0[1] + ((t - p0[0]) / dt) * (p1[1] - p0[1]);
+      }
+    }
+    return last[1];
+  }
+
+  function slidingWindowRate(pts, curT, curR, lookbackSec, minSpanSec = 1800) {
+    if (!pts.length) return null;
+    const refT = Math.max(pts[0][0], curT - lookbackSec);
+    const dt = curT - refT;
+    if (dt < minSpanSec) return null;
+    const refR = interpAtTime(pts, refT);
+    if (refR == null) return null;
+    return Math.min(0, (curR - refR) / dt);
   }
 
   function computeProjection(series, floor, g, lastRun, limit, windowKind, sampleStep, resetTimes = []) {
@@ -1563,8 +1651,6 @@
     const last = pts[pts.length - 1];
     if (!(last[1] > 0)) return null;
 
-    let rate = null;
-    let t0 = lastRun.end;
     const winLen = WINDOW_SECONDS[windowKind];
     const latestReset = latestResetAtOrBefore(resetTimes, g.now);
 
@@ -1580,37 +1666,199 @@
       }
     }
 
+    // Parse optional real-time post-sample estimate & CPAMP idle confirmation (never mutating series.points!)
+    const rawEst = Array.isArray(series.estimated_point) && series.estimated_point.length >= 2
+      ? [Number(series.estimated_point[0]), Number(series.estimated_point[1])]
+      : null;
+    const estValid = !!(
+      rawEst &&
+      Number.isFinite(rawEst[0]) &&
+      Number.isFinite(rawEst[1]) &&
+      rawEst[0] > last[0] + 20 &&
+      rawEst[0] <= g.now + 60
+    );
+    const estT = estValid ? Math.min(g.now, rawEst[0]) : null;
+    const estRem = estValid ? Math.max(0, Math.min(last[1], rawEst[1])) : null;
+    const hasLiveBurn = estValid && (last[1] - estRem) >= 0.02;
+    const confirmedIdle = series.post_sample_requests === 0;
+    const hasPostSampleActivity = (series.post_sample_requests > 0) || hasLiveBurn;
+    const sinceLastSec = Math.max(0, g.now - last[0]);
+
+    let rate = null;
+    const t0 = last[0];
+    const v0 = last[1];
+    let via = null;
+    let viaIsLiveBurn = false;
+
     if (windowKind === '7d') {
       const resetSec = series.reset_sec;
-      let start = resetSec - winLen;
-      if (latestReset != null && latestReset > start) {
-        start = latestReset;
-      }
-      const low = floor[floor.length - 1];
-      const cycleStartPt = floor[startIdx];
-      if (low && resetSec > g.now && start < g.now && low[0] >= start && (!cycleStartPt || low[0] >= cycleStartPt[0])) {
-        rate = -(100 - low[1]) / (g.now - start);
+      const cycleStart = resetSec - winLen;
+      if (resetSec > g.now && cycleStart < g.now && last[0] >= cycleStart - RESET_DRIFT) {
+        const cycPts = floor.slice(startIdx).filter(p => p[0] >= cycleStart - RESET_DRIFT);
+        if (!cycPts.length || cycPts[0][0] > cycleStart + 60) {
+          cycPts.unshift([cycleStart, 100]);
+        }
+        let curT = last[0];
+        let curR = last[1];
+        if (hasLiveBurn) {
+          cycPts.push([estT, estRem]);
+          curT = estT;
+          curR = estRem;
+          via = [estT, estRem];
+          viaIsLiveBurn = true;
+        } else if (confirmedIdle && sinceLastSec >= 600) {
+          cycPts.push([g.now, last[1]]);
+          curT = g.now;
+          curR = last[1];
+          via = [g.now, last[1]];
+        }
+
+        const elapsedCycle = Math.max(60, curT - cycleStart);
+        // Exact time-matched whole-cycle average rate (fixes denominator time mismatch)
+        const overallRate = -(100 - curR) / elapsedCycle;
+
+        const rate6h = slidingWindowRate(cycPts, curT, curR, 6 * 3600, 1800);
+        const rate12h = slidingWindowRate(cycPts, curT, curR, 12 * 3600, 1800);
+        const rate2h = slidingWindowRate(cycPts, curT, curR, 2 * 3600, 900);
+
+        if (elapsedCycle < 6 * 3600 || (rate6h == null && rate12h == null)) {
+          rate = overallRate;
+        } else {
+          const r6 = rate6h != null ? rate6h : rate12h;
+          const r12 = rate12h != null ? rate12h : rate6h;
+          const burn6 = -r6;
+          const burn12 = -r12;
+          const burnAll = -overallRate;
+
+          let recentRate;
+          let wRecent;
+          if (burn6 > Math.max(burn12, burnAll) * 1.25) {
+            // Accelerating burst: emphasize recent 6h burn velocity
+            recentRate = 0.72 * r6 + 0.28 * r12;
+            wRecent = 0.78;
+          } else if (burn6 < Math.max(burn12, burnAll) * 0.5) {
+            // Slowing down or long pause: decay smoothly toward recent flat pace
+            const flat6 = burn6 < 0.05 / (6 * 3600);
+            const flat12 = burn12 < 0.05 / (12 * 3600);
+            if (!hasPostSampleActivity && flat12) {
+              recentRate = r6;
+              wRecent = 0.94;
+            } else if (!hasPostSampleActivity && flat6) {
+              recentRate = 0.75 * r6 + 0.25 * r12;
+              wRecent = 0.84;
+            } else {
+              recentRate = 0.65 * r6 + 0.35 * r12;
+              wRecent = 0.72;
+            }
+          } else {
+            // Steady pace
+            recentRate = 0.55 * r6 + 0.45 * r12;
+            wRecent = 0.65;
+          }
+          rate = wRecent * recentRate + (1 - wRecent) * overallRate;
+
+          // Reflect acute real-time bursts on 7d within 15s
+          if (hasLiveBurn && rate2h != null && -rate2h > Math.max(burn6, burnAll) * 1.4 && (last[1] - estRem) >= 0.15) {
+            rate = 0.35 * rate2h + 0.65 * rate;
+          }
+          // Confirmed idle attenuation after 2h quiet + 10m zero requests
+          if (!hasPostSampleActivity && confirmedIdle && sinceLastSec >= 600 && rate2h != null && -rate2h < 0.05 / (2 * 3600)) {
+            rate *= 0.5;
+          }
+        }
       }
     } else {
+      // 5h window projection
       const cycPts = floor.slice(startIdx);
+      const resetSec = series.reset_sec;
+      const cycleStart = resetSec > g.now ? resetSec - winLen : 0;
+      if (cycleStart > 0 && cycPts.length > 0 && cycPts[0][0] > cycleStart + 60 && cycPts[0][1] < 99.999) {
+        if (latestReset == null || cycleStart >= latestReset - RESET_DRIFT) {
+          cycPts.unshift([cycleStart, 100]);
+        }
+      }
+
       const tail = cycPts[cycPts.length - 1];
-      const held = (g.now - tail[0]) > Math.max(HOLD_AFTER, sampleStep * 1.5);
-      if (held) cycPts.push([g.now, tail[1]]);
-      rate = recentSlope(cycPts);
-      if (!held) t0 = last[0];
+      let idleHeld = false;
+      if (hasLiveBurn) {
+        cycPts.push([estT, estRem]);
+        via = [estT, estRem];
+        viaIsLiveBurn = true;
+      } else if (confirmedIdle && sinceLastSec >= 600) {
+        cycPts.push([g.now, tail[1]]);
+        via = [g.now, tail[1]];
+        idleHeld = true;
+      } else if (!hasPostSampleActivity && sinceLastSec > Math.max(HOLD_AFTER, sampleStep * 1.5)) {
+        cycPts.push([g.now, tail[1]]);
+        via = [g.now, tail[1]];
+      }
+
+      // Silence detector: >= 2 consecutive intervals (>= 15m span) with < 0.08% drop and no active requests -> flat 0
+      let isQuietFlat = false;
+      if (!hasPostSampleActivity && cycPts.length >= 3) {
+        const endPt = cycPts[cycPts.length - 1];
+        let flatIdx = cycPts.length - 1;
+        while (flatIdx > 0 && Math.abs(cycPts[flatIdx - 1][1] - endPt[1]) < 0.08) {
+          flatIdx--;
+        }
+        const flatIntervals = (cycPts.length - 1) - flatIdx;
+        const flatSpan = endPt[0] - cycPts[flatIdx][0];
+        if (flatIntervals >= 2 && flatSpan >= 900) {
+          isQuietFlat = true;
+        }
+      }
+
+      if (isQuietFlat) {
+        rate = 0;
+      } else {
+        rate = recentSlope(cycPts, 900);
+        // Smooth decay during confirmed 10m..15m idle period
+        if (idleHeld && rate < 0) {
+          if (sinceLastSec >= 900) {
+            rate = 0;
+          } else {
+            const decay = Math.max(0, (900 - sinceLastSec) / 300) * 0.5;
+            rate *= decay;
+          }
+        }
+      }
     }
+
     if (rate == null || !Number.isFinite(rate)) return null;
 
     const slope = Math.min(0, rate);
-    const v0 = last[1];
-    const out = slope < 0 ? t0 + v0 / -slope : Infinity;
+    const anchorT = via ? via[0] : t0;
+    const anchorV = via ? via[1] : v0;
+
+    let out = Infinity;
+    if (anchorV <= 0) {
+      out = anchorT;
+    } else if (slope < 0) {
+      out = anchorT + anchorV / -slope;
+    }
+    const end = Math.min(out, g.to);
+    const left = out <= g.to ? 0 : Math.max(0, anchorV + slope * (g.to - anchorT));
+
     return {
       t0,
       v0,
-      end: Math.min(out, g.to),
+      via,
+      viaIsLiveBurn,
+      anchorT,
+      anchorV,
+      slope,
+      end,
       out: out <= g.to ? out : null,
-      left: out <= g.to ? 0 : Math.max(0, v0 + slope * (g.to - t0)),
-      at: (t) => (t < t0 || t > g.to ? null : Math.max(0, v0 + slope * (t - t0))),
+      left,
+      at: (t) => {
+        if (t < t0 || t > g.to) return null;
+        if (via && t <= via[0]) {
+          const dt = via[0] - t0;
+          if (!(dt > 0)) return via[1];
+          return Math.max(0, v0 + ((t - t0) / dt) * (via[1] - v0));
+        }
+        return Math.max(0, anchorV + slope * (t - anchorT));
+      },
     };
   }
 
@@ -1973,7 +2221,14 @@
       rightText.appendChild(tDot);
       rightText.appendChild(tPct);
       if (r.reset_sec > nowSec) {
-        const tRst = svgEl('tspan', { fill: colText3, 'font-size': 10.5 });
+        const tRst = svgEl('tspan', {
+          fill: colText3,
+          'font-size': 10.5,
+          class: 'cd-target',
+          'data-ts': r.reset_sec * 1000,
+          'data-compact': '1',
+          'data-prefix': '  ↻ ',
+        });
         tRst.textContent = '  ↻ ' + fmtCompactCountdown(r.reset_sec * 1000);
         rightText.appendChild(tRst);
       }
@@ -2101,13 +2356,26 @@
 
     const pSegs = paceSegments(selectedRow.resets, winLen, selectedRow.reset_sec, g.now);
     const pExts = paceExtensions(pSegs, selectedRow.points, winLen, selectedRow.cycleResetTimes);
+    const obsSec = (selectedRow.observed_sec > 0 && selectedRow.observed_sec <= g.now)
+      ? selectedRow.observed_sec
+      : (selPts.length ? selPts[selPts.length - 1][0] : g.now);
     const paceNow = paceAt(pSegs, winLen, g.now);
-    const diffNow = paceNow == null ? null : Math.round(selectedRow.remaining - paceNow);
+    const paceAtObs = paceAt(pSegs, winLen, obsSec) ?? extendedPaceAt(pExts, winLen, obsSec);
+    const refPaceForDiff = paceAtObs != null ? paceAtObs : paceNow;
+    const diffNow = refPaceForDiff == null ? null : Math.round(selectedRow.remaining - refPaceForDiff);
     const diffCls = diffNow == null ? '' : diffNow > 0 ? 'ahead' : diffNow < 0 ? 'behind' : '';
 
     const resetDisplay = selectedRow.reset_sec > nowSec
       ? `<span class="cd-target num" data-ts="${selectedRow.reset_sec * 1000}" data-compact="1">${fmtCompactCountdown(selectedRow.reset_sec * 1000)}</span>`
       : (selectedRow.remaining >= 99.999 ? '未开窗' : '—');
+
+    const curTitle = `官方采样时刻 ${fmtDateTime(obsSec * 1000)} 余量 ${fmtPct(selectedRow.remaining, 2)}`;
+    const paceTitle = paceNow != null
+      ? `当前时刻匀速目标 ${fmtPct(paceNow, 1)}${paceAtObs != null && Math.abs(g.now - obsSec) >= 30 ? `（采样时刻 ${fmtHM(obsSec * 1000)} 目标 ${fmtPct(paceAtObs, 1)}）` : ''}`
+      : '未开窗或暂无匀速基线';
+    const diffTitle = refPaceForDiff != null
+      ? `按同一采样时刻 ${fmtHM(obsSec * 1000)} 对齐：${fmtPct(selectedRow.remaining, 1)} − ${fmtPct(refPaceForDiff, 1)} = ${fmtDiffPct(diffNow)}`
+      : '暂无差值';
 
     function renderLiveDetailHead() {
       detailHead.classList.remove('scrubbing');
@@ -2118,9 +2386,9 @@
           ${isMobile ? `<span class="lamp-kpi-hint">滑动看读数</span>` : ''}
         </div>
         <div class="lamp-kpi-stats num">
-          <span class="lamp-kpi-item"><span>当前</span><strong style="color:${pctTextColor(selectedRow.remaining)}">${fmtRoundPct(selectedRow.remaining)}</strong></span>
-          <span class="lamp-kpi-item"><span>匀速</span><strong>${fmtRoundPct(paceNow)}</strong></span>
-          <span class="lamp-kpi-item"><span>差值</span><strong class="${diffCls}">${fmtDiffPct(diffNow)}</strong></span>
+          <span class="lamp-kpi-item" title="${esc(curTitle)}"><span>当前</span><strong style="color:${pctTextColor(selectedRow.remaining)}">${fmtRoundPct(selectedRow.remaining)}</strong></span>
+          <span class="lamp-kpi-item" title="${esc(paceTitle)}"><span>匀速</span><strong>${fmtRoundPct(paceNow)}</strong></span>
+          <span class="lamp-kpi-item" title="${esc(diffTitle)}"><span>差值</span><strong class="${diffCls}">${fmtDiffPct(diffNow)}</strong></span>
           <span class="lamp-kpi-item"><span>距重置</span><strong>${resetDisplay}</strong></span>
         </div>
       `;
@@ -2144,7 +2412,12 @@
       }
       const diffVal = (valNum != null && refPace != null) ? Math.round(valNum - refPace) : null;
       const dCls = diffVal == null ? '' : diffVal > 0 ? 'ahead' : diffVal < 0 ? 'behind' : '';
-      const timeBadge = `${fmtDateTime(t * 1000)}${isFuture ? ' · 预测' : ''}${nearReset ? ' · ↻重置' : ''}`;
+      const projMeta = isFuture && ahead
+        ? (ahead.out != null
+            ? ` · 预计 ${hist.window === '7d' ? fmtDateTime(ahead.out * 1000) : fmtHM(ahead.out * 1000)} 耗尽`
+            : ` · 期末余 ${fmtRoundPct(ahead.left)}`)
+        : '';
+      const timeBadge = `${fmtDateTime(t * 1000)}${isFuture ? ' · 预测' + projMeta : ''}${nearReset ? ' · ↻重置' : ''}`;
 
       detailHead.classList.add('scrubbing');
       detailHead.innerHTML = `
@@ -2373,20 +2646,37 @@
       }
     }
 
-    // Linear extrapolation projection dotted line
+    // Real-time-aware projection dotted trajectory (starts from last real sample, optionally via live estimate point)
     const rightLabelX = labelW + plotW + 6;
     if (ahead) {
       const px = g.x(ahead.end);
       const py = yOf(ahead.out != null ? 0 : ahead.left);
-      detailSvg.appendChild(svgEl('line', {
-        x1: g.x(ahead.t0), y1: yOf(ahead.v0), x2: px, y2: py,
-        stroke: ahead.out != null ? colRedWarn : fam.a,
+      const projStroke = ahead.out != null ? colRedWarn : fam.a;
+      const startCurveV = evalCurvePct(ahead.t0);
+      let projD = `M${g.x(ahead.t0).toFixed(2)} ${yOf(startCurveV != null ? startCurveV : ahead.v0).toFixed(2)}`;
+      if (ahead.via && ahead.via[0] > ahead.t0 && ahead.via[0] < ahead.end) {
+        projD += `L${g.x(ahead.via[0]).toFixed(2)} ${yOf(ahead.via[1]).toFixed(2)}`;
+      }
+      projD += `L${px.toFixed(2)} ${py.toFixed(2)}`;
+
+      detailSvg.appendChild(svgEl('path', {
+        d: projD,
+        fill: 'none',
+        stroke: projStroke,
         'stroke-opacity': 0.88, 'stroke-width': 2,
-        'stroke-dasharray': '1.5 4.5', 'stroke-linecap': 'round',
+        'stroke-dasharray': '1.5 4.5', 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+        'data-role': 'proj-line',
       }));
+      if (ahead.via && ahead.viaIsLiveBurn && ahead.via[0] > ahead.t0 && ahead.via[0] < ahead.end) {
+        detailSvg.appendChild(svgEl('circle', {
+          cx: g.x(ahead.via[0]), cy: yOf(ahead.via[1]), r: 3.1,
+          fill: colSurface, stroke: projStroke, 'stroke-width': 1.8,
+          'data-role': 'proj-live-est',
+        }));
+      }
       detailSvg.appendChild(svgEl('circle', {
         cx: px, cy: py, r: 3.5,
-        fill: ahead.out != null ? colRedWarn : fam.a,
+        fill: projStroke,
         stroke: colSurface, 'stroke-width': 1.5,
       }));
       if (outLabel) {
@@ -2402,7 +2692,7 @@
       }
     }
 
-    // Latest live sample dot
+    // Latest live real .jsonl sample dot
     const latestPt = (selectedRow.points || [])[selectedRow.points.length - 1];
     if (latestPt && lastRun && lastRun.end >= g.now - limit) {
       const lt = ahead ? ahead.t0 : lastRun.end;
@@ -2515,13 +2805,28 @@
             <span class="num">${projVal != null ? fmtPct(projVal, 1) : '—'}</span>
           </div>`,
         ];
+        if (ahead && ahead.viaIsLiveBurn && ahead.via) {
+          rowsHtml.push(`<div class="lamp-tip-row">
+            <span class="lamp-tip-left"><span class="lamp-tip-key" style="background:var(--accent)"></span>当前实时估算</span>
+            <span class="num">${fmtPct(ahead.via[1], 1)}</span>
+          </div>`);
+        }
         if (paceVal != null) {
           rowsHtml.push(`<div class="lamp-tip-row">
             <span class="lamp-tip-left"><span class="lamp-tip-key line-pace"></span>匀速参考</span>
             <span class="num">${fmtPct(paceVal, 1)}</span>
           </div>`);
         }
-        detailTip.innerHTML = `<div class="lamp-tip-time">${fmtDateTime(t * 1000)} · 预测</div>${rowsHtml.join('')}`;
+        let projNote = '';
+        if (ahead) {
+          if (ahead.out != null) {
+            const outStr = hist.window === '7d' ? fmtDateTime(ahead.out * 1000) : fmtHM(ahead.out * 1000);
+            projNote = `<div class="lamp-tip-note" style="color:var(--red-text);font-weight:600;">预计 ${esc(outStr)} 耗尽（约 ${esc(fmtCompactCountdown(ahead.out * 1000))} 后）</div>`;
+          } else {
+            projNote = `<div class="lamp-tip-note">按当前速率，周期结束预计剩余 <strong>${fmtPct(ahead.left, 1)}</strong></div>`;
+          }
+        }
+        detailTip.innerHTML = `<div class="lamp-tip-time">${fmtDateTime(t * 1000)} · 预测</div>${rowsHtml.join('')}${projNote}`;
         detailTip.hidden = false;
         placeTipBox(detailTip, detailBox, g, t, 8);
         return;
@@ -2842,7 +3147,11 @@
       if (!peakSlot || v > valOf(peakSlot)) peakSlot = s;
     }
     const peakVal = peakSlot ? valOf(peakSlot) : 0;
-    const avgVal = elapsedSlots.length > 0 ? sumElapsed / elapsedSlots.length : 0;
+    const nowMs = state.snapshot?.generated_at_ms || Date.now();
+    const elapsedHours = (ais.cycle_start_ms > 0)
+      ? Math.max(1, Math.min(24, (nowMs - ais.cycle_start_ms) / 3600000))
+      : Math.max(1, elapsedSlots.length);
+    const avgVal = elapsedSlots.length > 0 ? sumElapsed / elapsedHours : 0;
     const peakChip = peakVal > 0
       ? `<span class="micro-chip num">峰值 <strong>${esc(peakSlot.label)}</strong> · ${metric === 'tokens' ? fmtCompact(peakVal) : fmtInt(peakVal) + '次'}</span>`
       : `<span class="micro-chip">暂无峰值</span>`;
@@ -3873,7 +4182,7 @@
     const refreshBtn = document.getElementById('btn-refresh');
     if (refreshBtn) {
       refreshBtn.addEventListener('click', () => {
-        fetchSnapshot(true);
+        fetchSnapshot(true, true);
       });
     }
 
@@ -3949,13 +4258,13 @@
     });
   }
 
-  // ---------- 1s Live Countdown Tick & 30s Silent Polling ----------
+  // ---------- 1s Live Countdown Tick & Meta-Synced Silent Polling ----------
   setInterval(() => {
     if (state.snapshot && !state.gateOpen) {
       state.countdown--;
       if (state.countdown <= 0) {
-        state.countdown = POLL_SECONDS;
-        fetchSnapshot(false);
+        state.countdown = pollIntervalSeconds();
+        fetchSnapshot(false, false);
       }
       updateSyncMeta();
     }
@@ -3963,12 +4272,17 @@
       document.querySelectorAll('.cd-target').forEach(el => {
         const ts = Number(el.getAttribute('data-ts'));
         if (!(ts > 0)) return;
+        const prefix = el.getAttribute('data-prefix') ?? '';
         if (el.getAttribute('data-compact') === '1') {
-          el.textContent = fmtCompactCountdown(ts);
+          el.textContent = prefix + fmtCompactCountdown(ts);
         } else {
           const suffix = el.getAttribute('data-suffix') ?? '';
-          el.textContent = fmtCountdown(ts, suffix);
+          el.textContent = prefix + fmtCountdown(ts, suffix);
         }
+      });
+      document.querySelectorAll('.age-target').forEach(el => {
+        const ts = Number(el.getAttribute('data-obs-ts'));
+        if (ts > 0) el.textContent = fmtSampleAge(ts);
       });
       document.querySelectorAll('.cd-hms').forEach(el => {
         const ts = Number(el.getAttribute('data-ts'));
@@ -3987,6 +4301,7 @@
       const metaResp = await fetch('/api/meta', { cache: 'no-store' });
       if (metaResp.ok) {
         state.meta = await metaResp.json();
+        state.countdown = pollIntervalSeconds();
       }
     } catch {}
 
@@ -3997,7 +4312,7 @@
 
     showShell();
     renderSkeleton();
-    await fetchSnapshot(false);
+    await fetchSnapshot(false, false);
   }
 
   bootstrap();

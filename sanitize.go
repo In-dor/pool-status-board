@@ -80,7 +80,16 @@ func round3(v float64) float64 {
 	return math.Round(v*1000) / 1000
 }
 
+func round4(v float64) float64 {
+	return math.Round(v*10000) / 10000
+}
+
 func floatPtr(v float64) *float64 {
+	x := v
+	return &x
+}
+
+func int64Ptr(v int64) *int64 {
 	x := v
 	return &x
 }

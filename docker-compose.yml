@@ -11,7 +11,7 @@ services:
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       LISTEN_ADDR: ":8080"
-      REFRESH_INTERVAL_SECONDS: "${REFRESH_INTERVAL_SECONDS:-60}"
+      REFRESH_INTERVAL_SECONDS: "${REFRESH_INTERVAL_SECONDS:-15}"
       VIEW_PASSCODE: "${VIEW_PASSCODE:-}"
       CPAMP_BASE_URL: "${CPAMP_BASE_URL:-http://cpa-manager-plus:18317}"
       AIS_BASE_URL: "${AIS_BASE_URL:-http://aistudio2api:2048}"

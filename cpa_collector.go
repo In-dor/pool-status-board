@@ -40,8 +40,16 @@ type CPACollector struct {
 	lastKeySize   int64
 	lastKeyExists bool
 
+	lampStateMu    sync.Mutex
+	lastLampMtime  time.Time
+	lastLampSize   int64
+	lastLampExists bool
+
 	histFileMu    sync.Mutex
 	histFileCache map[string]cachedLampFile
+
+	fbCacheMu sync.Mutex
+	fbCache   map[forecastBaseCacheKey]cachedForecastBase
 
 	histStoreMu sync.RWMutex
 	histStore   *cpaHistoryStore
@@ -60,7 +68,31 @@ func NewCPACollector(cfg CPAConfig) *CPACollector {
 			},
 		},
 		histFileCache: map[string]cachedLampFile{},
+		fbCache:       map[forecastBaseCacheKey]cachedForecastBase{},
 	}
+}
+
+// CheckLamplighterStateChanged performs a lightweight read-only os.Stat check on
+// lamplighter/state.json and returns true when its ModTime or Size has changed.
+func (c *CPACollector) CheckLamplighterStateChanged() bool {
+	if strings.TrimSpace(c.cfg.LamplighterDir) == "" {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(c.cfg.LamplighterDir, "state.json"))
+	c.lampStateMu.Lock()
+	defer c.lampStateMu.Unlock()
+
+	if err != nil {
+		c.lastLampExists = false
+		c.lastLampMtime = time.Time{}
+		c.lastLampSize = 0
+		return false
+	}
+	changed := !c.lastLampExists || !info.ModTime().Equal(c.lastLampMtime) || info.Size() != c.lastLampSize
+	c.lastLampExists = true
+	c.lastLampMtime = info.ModTime()
+	c.lastLampSize = info.Size()
+	return changed
 }
 
 // CheckSecretKeyChanged checks if the secret key file was created/updated since last check.
@@ -155,17 +187,35 @@ type lampHistoryPoint struct {
 	X int64
 }
 
+type forecastBaseCacheKey struct {
+	AccountKey   string
+	WindowKey    string
+	WinStartMs   int64
+	ObservedAtMs int64
+}
+
+type cachedForecastBase struct {
+	Item     cpampWindowUsageItem
+	CachedAt time.Time
+}
+
 type cpaWindowHistory struct {
-	Key             string
-	Group           string
-	Label           string
-	WindowKind      string // "5h" | "7d"
-	DurationSeconds int64
-	Remaining       float64
-	ResetSec        int64 // effective reset sec (0 if unopened full or expired)
-	RawResetSec     int64
-	ObservedSec     int64
-	Points          []lampHistoryPoint
+	Key                       string
+	Group                     string
+	Label                     string
+	WindowKind                string // "5h" | "7d"
+	DurationSeconds           int64
+	Remaining                 float64
+	ResetSec                  int64 // effective reset sec (0 if unopened full or expired)
+	RawResetSec               int64
+	ObservedSec               int64
+	Stale                     bool
+	HasPostSampleCheck        bool
+	PostSampleCostUSD         float64
+	PostSampleTokens          int64
+	PostSampleRequests        int64
+	EstimatedRemainingPercent *float64
+	Points                    []lampHistoryPoint
 }
 
 type cpaAccountHistoryStore struct {
@@ -180,24 +230,31 @@ type cpaHistoryStore struct {
 }
 
 type internalCPAWindow struct {
-	key              string
-	label            string
-	group            string
-	providerWindowID string
-	durationSeconds  int64
-	modelScopeKey    string // "claude_gpt" | "gemini" | ""
-	remainingPercent float64
-	resetAtMs        int64
-	observedAtMs     int64
-	stale            bool
-	hasCurrentUsage  bool
-	currentRequests  int64
-	currentTokens    int64
-	currentCost      float64
-	hasForecast      bool
-	forecastBasis    string
-	forecastTokens   int64
-	forecastCost     float64
+	key                       string
+	label                     string
+	group                     string
+	providerWindowID          string
+	durationSeconds           int64
+	modelScopeKey             string // "claude_gpt" | "gemini" | ""
+	remainingPercent          float64
+	resetAtMs                 int64
+	observedAtMs              int64
+	stale                     bool
+	fromPriority              bool
+	priorityResetOrExhausted  bool
+	hasCurrentUsage           bool
+	currentRequests           int64
+	currentTokens             int64
+	currentCost               float64
+	hasForecast               bool
+	forecastBasis             string
+	forecastTokens            int64
+	forecastCost              float64
+	hasPostSampleCheck        bool
+	postSampleCostUSD         float64
+	postSampleTokens          int64
+	postSampleRequests        int64
+	estimatedRemainingPercent *float64
 }
 
 // Local file schemas
@@ -498,15 +555,13 @@ func (c *CPACollector) Collect(ctx context.Context) AntigravityPool {
 		acc.rowKey = fmt.Sprintf("ag-row-%d", idx)
 	}
 
-	// 4. Populate quota windows from lamplighter (+ priority fallback)
+	// 4. Populate quota windows from lamplighter (+ strict priority fallback)
 	for _, acc := range filtered {
 		acc.windows = buildAccountWindows(acc.authIndex, acc.tier, lampState, prioState, nowMs)
 	}
 
-	// 5. Refresh 36-day lamplighter history store in memory (archived daily files cached by size+mtime)
-	c.refreshHistoryStore(filtered, now)
-
-	// 6. Query CPAMP account-history & account-window-usage if key is active
+	// 5. Query CPAMP account-history & account-window-usage BEFORE refreshing history store
+	// so post-sample delta / estimated_remaining_percent can be surfaced on history series.
 	if adminKey != "" && pool.CPAMPStatus == "ok" && len(filtered) > 0 {
 		if statusCode, hErr := c.enrichHistory(ctx, adminKey, filtered); hErr != nil {
 			if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
@@ -524,6 +579,9 @@ func (c *CPACollector) Collect(ctx context.Context) AntigravityPool {
 			}
 		}
 	}
+
+	// 6. Refresh 36-day lamplighter history store in memory (archived daily files cached by size+mtime)
+	c.refreshHistoryStore(filtered, now)
 
 	// 7. Build strictly sanitized public DTOs and summary
 	winSum := map[string]float64{}
@@ -575,23 +633,27 @@ func (c *CPACollector) Collect(ctx context.Context) AntigravityPool {
 		for _, w := range acc.windows {
 			usedPct := clampPercent(100.0 - w.remainingPercent)
 			pubWindows = append(pubWindows, AntigravityWindow{
-				Key:              w.key,
-				Label:            w.label,
-				Group:            w.group,
-				DurationSeconds:  w.durationSeconds,
-				RemainingPercent: round3(w.remainingPercent),
-				UsedPercent:      round3(usedPct),
-				ResetAtMs:        w.resetAtMs,
-				ObservedAtMs:     w.observedAtMs,
-				Stale:            w.stale,
-				HasCurrentUsage:  w.hasCurrentUsage,
-				CurrentRequests:  w.currentRequests,
-				CurrentTokens:    w.currentTokens,
-				CurrentCost:      round2(w.currentCost),
-				HasForecast:      w.hasForecast,
-				ForecastBasis:    w.forecastBasis,
-				ForecastTokens:   w.forecastTokens,
-				ForecastCost:     round2(w.forecastCost),
+				Key:                       w.key,
+				Label:                     w.label,
+				Group:                     w.group,
+				DurationSeconds:           w.durationSeconds,
+				RemainingPercent:          round3(w.remainingPercent),
+				UsedPercent:               round3(usedPct),
+				ResetAtMs:                 w.resetAtMs,
+				ObservedAtMs:              w.observedAtMs,
+				Stale:                     w.stale,
+				HasCurrentUsage:           w.hasCurrentUsage,
+				CurrentRequests:           w.currentRequests,
+				CurrentTokens:             w.currentTokens,
+				CurrentCost:               round2(w.currentCost),
+				HasForecast:               w.hasForecast,
+				ForecastBasis:             w.forecastBasis,
+				ForecastTokens:            w.forecastTokens,
+				ForecastCost:              round2(w.forecastCost),
+				PostSampleCostUSD:         round4(w.postSampleCostUSD),
+				PostSampleTokens:          w.postSampleTokens,
+				PostSampleRequests:        w.postSampleRequests,
+				EstimatedRemainingPercent: w.estimatedRemainingPercent,
 			})
 			winSum[w.key] += w.remainingPercent
 			winCnt[w.key]++
@@ -840,8 +902,10 @@ func buildAccountWindows(authIndex, tier string, lamp *rawLamplighterState, prio
 		var found bool
 		var rem float64
 		var resetMs, obsMs int64
+		var fromPriority bool
+		var priorityResetOrExhausted bool
 
-		// Primary source: lamplighter/state.json (high precision float remaining)
+		// Primary source: lamplighter/state.json (high precision 6-decimal float remaining)
 		if lamp != nil {
 			groupKey := fmt.Sprintf("antigravity:%s:antigravity:%s", authIndex, d.lampGroupSuffix)
 			if grp, ok := lamp.Groups[groupKey]; ok {
@@ -858,7 +922,12 @@ func buildAccountWindows(authIndex, tier string, lamp *rawLamplighterState, prio
 			}
 		}
 
-		// Secondary complementary source: antigravity-priority/state.json
+		// Secondary complementary source: antigravity-priority/state.json (rounded integer percentages).
+		// STRICTLY NEVER overwrite high-precision lamplighter float percentages merely because priority
+		// has a newer observed_at. Only adopt priority data under 3 strict conditions:
+		//  1. lamplighter has no data for this window (!found)
+		//  2. priority first caught a real new cycle reset (pReset > resetMs + 60s && pRem >= 99) on an active/anchored cycle
+		//  3. priority first caught quota exhaustion circuit-breaker (rem > 0 && pRem <= 0 && pObs > obsMs)
 		if prio != nil {
 			pKey := fmt.Sprintf("%s|model_group=%s", authIndex, d.prioGroup)
 			if pe, ok := prio.Entries[pKey]; ok {
@@ -870,23 +939,42 @@ func buildAccountWindows(authIndex, tier string, lamp *rawLamplighterState, prio
 				case "short":
 					pReset = parseRFC3339Ms(pe.ShortWindowResetAt)
 					pRem = clampPercent(pe.ShortWindowRemaining)
-					pValid = pReset > 0 || pObs > 0
+					pValid = pReset > 0 || pRem > 0
 				case "long":
 					pReset = parseRFC3339Ms(pe.LongWindowResetAt)
 					pRem = clampPercent(pe.LongWindowRemaining)
-					pValid = pReset > 0 || pObs > 0
+					pValid = pReset > 0 || pRem > 0
 				case "argon":
 					pReset = parseRFC3339Ms(pe.ArgonWindowResetAt)
 					pRem = clampPercent(pe.ArgonWindowRemaining)
 					pValid = pReset > 0
 				}
 				if pValid {
-					// Use priority only if lamplighter didn't have it, or priority is strictly much fresher (> 2 min)
-					if !found || (pObs > obsMs+120_000 && pReset > 0) {
+					durMs := d.durationSeconds * 1000
+					lampUnopened := found && rem >= 99.999 && resetMs > 0 && obsMs > 0 && durMs > 0 && (resetMs-obsMs) >= (durMs-120_000)
+					isRealNewCycle := found && !lampUnopened && resetMs > 0 && pReset > resetMs+60_000 && pRem >= 99
+					isExhaustedNow := found && rem > 0 && pRem <= 0 && pObs > obsMs
+
+					if !found {
 						found = true
 						rem = pRem
 						resetMs = pReset
 						obsMs = pObs
+						fromPriority = true
+					} else if isRealNewCycle {
+						rem = pRem
+						resetMs = pReset
+						obsMs = pObs
+						fromPriority = true
+						priorityResetOrExhausted = true
+					} else if isExhaustedNow {
+						rem = 0
+						if pReset > 0 {
+							resetMs = pReset
+						}
+						obsMs = pObs
+						fromPriority = true
+						priorityResetOrExhausted = true
 					} else if resetMs == 0 && pReset > 0 {
 						resetMs = pReset
 					}
@@ -903,16 +991,18 @@ func buildAccountWindows(authIndex, tier string, lamp *rawLamplighterState, prio
 
 		stale := resetMs > 0 && resetMs <= nowMs
 		out = append(out, internalCPAWindow{
-			key:              d.key,
-			label:            d.label,
-			group:            d.group,
-			providerWindowID: d.lampWinKey,
-			durationSeconds:  d.durationSeconds,
-			modelScopeKey:    d.modelScopeKey,
-			remainingPercent: rem,
-			resetAtMs:        resetMs,
-			observedAtMs:     obsMs,
-			stale:            stale,
+			key:                      d.key,
+			label:                    d.label,
+			group:                    d.group,
+			providerWindowID:         d.lampWinKey,
+			durationSeconds:          d.durationSeconds,
+			modelScopeKey:            d.modelScopeKey,
+			remainingPercent:         rem,
+			resetAtMs:                resetMs,
+			observedAtMs:             obsMs,
+			stale:                    stale,
+			fromPriority:             fromPriority,
+			priorityResetOrExhausted: priorityResetOrExhausted,
 		})
 	}
 	return out
@@ -1193,14 +1283,22 @@ func (c *CPACollector) refreshHistoryStore(accounts []*internalCPAAccount, now t
 				wh.Remaining = round3(clampPercent(lw.remainingPercent))
 				wh.RawResetSec = lw.resetAtMs / 1000
 				wh.ObservedSec = lw.observedAtMs / 1000
+				wh.Stale = lw.stale
+				wh.HasPostSampleCheck = lw.hasPostSampleCheck
+				wh.PostSampleCostUSD = lw.postSampleCostUSD
+				wh.PostSampleTokens = lw.postSampleTokens
+				wh.PostSampleRequests = lw.postSampleRequests
+				wh.EstimatedRemainingPercent = lw.estimatedRemainingPercent
 				if wh.ObservedSec == 0 {
 					wh.ObservedSec = nowSec
 				}
 				if !lw.stale && wh.RawResetSec > nowSec {
 					wh.ResetSec = effectiveResetSec(wh.ObservedSec, wh.Remaining, wh.RawResetSec, meta.durationSeconds)
 				}
-				// Append live state sample if newer than last history point
-				if wh.ObservedSec > 0 && (len(wh.Points) == 0 || wh.ObservedSec > wh.Points[len(wh.Points)-1].T+30) {
+				// Append live state sample if newer than last history point, EXCEPT NEVER append
+				// a non-reset / non-exhausted integer priority sample onto a high-precision float .jsonl sequence.
+				allowAppend := !lw.fromPriority || len(wh.Points) == 0 || lw.priorityResetOrExhausted
+				if allowAppend && wh.ObservedSec > 0 && (len(wh.Points) == 0 || wh.ObservedSec > wh.Points[len(wh.Points)-1].T+30) {
 					wh.Points = append(wh.Points, lampHistoryPoint{
 						T: wh.ObservedSec,
 						R: wh.Remaining,
@@ -1339,18 +1437,40 @@ func (c *CPACollector) GetAccountHistory(accountID, windowKind, rangeName string
 			resetSec = 0
 		}
 
+		var estPoint []float64
+		var postSampleReqs *int64
+		if wh.HasPostSampleCheck && !wh.Stale {
+			postSampleReqs = int64Ptr(wh.PostSampleRequests)
+			if len(sampled) > 0 {
+				lastP := sampled[len(sampled)-1]
+				estNowSec := store.UpdatedAtSec
+				if estNowSec <= 0 {
+					estNowSec = toSec
+				}
+				if estNowSec > lastP.T+20 && lastP.R > 0 && (resetSec == 0 || estNowSec < resetSec) {
+					if wh.EstimatedRemainingPercent != nil && *wh.EstimatedRemainingPercent < lastP.R {
+						estPoint = []float64{float64(estNowSec), round3(*wh.EstimatedRemainingPercent)}
+					} else if wh.PostSampleRequests == 0 && wh.PostSampleCostUSD == 0 && wh.PostSampleTokens == 0 {
+						estPoint = []float64{float64(estNowSec), round3(lastP.R)}
+					}
+				}
+			}
+		}
+
 		resp.Series = append(resp.Series, AntigravityHistorySeries{
-			Key:             wh.Key,
-			Group:           wh.Group,
-			Label:           wh.Label,
-			DurationSeconds: wh.DurationSeconds,
-			Remaining:       wh.Remaining,
-			ResetSec:        resetSec,
-			RawResetSec:     wh.RawResetSec,
-			ObservedSec:     wh.ObservedSec,
-			Points:          pts,
-			Resets:          resets,
-			CycleResets:     cycleResets,
+			Key:                wh.Key,
+			Group:              wh.Group,
+			Label:              wh.Label,
+			DurationSeconds:    wh.DurationSeconds,
+			Remaining:          wh.Remaining,
+			ResetSec:           resetSec,
+			RawResetSec:        wh.RawResetSec,
+			ObservedSec:        wh.ObservedSec,
+			Points:             pts,
+			Resets:             resets,
+			CycleResets:        cycleResets,
+			EstimatedPoint:     estPoint,
+			PostSampleRequests: postSampleReqs,
 		})
 	}
 	return resp, true
@@ -1791,11 +1911,66 @@ func isRecentRequestOK(rr cpampRecentRequest) bool {
 	return true
 }
 
+const (
+	minQuotaForecastUsedPct   = 0.5
+	nearExhaustedRemainingPct = 1.5
+	fbCacheMaxAge             = 2 * time.Hour
+)
+
+func (c *CPACollector) getCachedForecastBase(key forecastBaseCacheKey) (cpampWindowUsageItem, bool) {
+	c.fbCacheMu.Lock()
+	defer c.fbCacheMu.Unlock()
+	if c.fbCache == nil {
+		return cpampWindowUsageItem{}, false
+	}
+	ent, ok := c.fbCache[key]
+	if !ok {
+		return cpampWindowUsageItem{}, false
+	}
+	if time.Since(ent.CachedAt) > fbCacheMaxAge {
+		delete(c.fbCache, key)
+		return cpampWindowUsageItem{}, false
+	}
+	return ent.Item, true
+}
+
+func (c *CPACollector) setCachedForecastBase(key forecastBaseCacheKey, item cpampWindowUsageItem, now time.Time) {
+	c.fbCacheMu.Lock()
+	defer c.fbCacheMu.Unlock()
+	if c.fbCache == nil {
+		c.fbCache = map[forecastBaseCacheKey]cachedForecastBase{}
+	}
+	// Periodically prune old entries when cache grows
+	if len(c.fbCache) > 256 {
+		for k, v := range c.fbCache {
+			if now.Sub(v.CachedAt) > fbCacheMaxAge {
+				delete(c.fbCache, k)
+			}
+		}
+	}
+	c.fbCache[key] = cachedForecastBase{
+		Item:     item,
+		CachedAt: now,
+	}
+}
+
 func (c *CPACollector) enrichWindowUsage(ctx context.Context, adminKey string, accounts []*internalCPAAccount, nowMs int64) (int, error) {
 	var mainTargets []cpampWindowTarget
 	var forecastBaseTargets []cpampWindowTarget
 
+	type fbTargetMeta struct {
+		cacheKey forecastBaseCacheKey
+		usedPct  float64
+	}
+	fbMetaByReqKey := map[string]fbTargetMeta{}
+	cachedFBResults := map[string]cpampWindowUsageItem{}
+	winBounds := map[string][2]int64{} // "rowKey|winKey" -> [winStartMs, curToMs]
+
 	for _, acc := range accounts {
+		accountKey := acc.authIndex
+		if accountKey == "" {
+			accountKey = acc.publicID
+		}
 		for i := range acc.windows {
 			w := &acc.windows[i]
 			if w.modelScopeKey == "" || w.resetAtMs <= 0 || w.durationSeconds <= 0 {
@@ -1816,6 +1991,8 @@ func (c *CPACollector) enrichWindowUsage(ctx context.Context, adminKey string, a
 			if w.resetAtMs < curToMs {
 				curToMs = w.resetAtMs
 			}
+			winBounds[fmt.Sprintf("%s|%s", acc.rowKey, w.key)] = [2]int64{winStartMs, curToMs}
+
 			if winStartMs < curToMs {
 				mainTargets = append(mainTargets, cpampWindowTarget{
 					RequestKey:            fmt.Sprintf("%s|%s|current", acc.rowKey, w.key),
@@ -1834,25 +2011,42 @@ func (c *CPACollector) enrichWindowUsage(ctx context.Context, adminKey string, a
 					AuthIndex:             acc.authIndex,
 					Source:                acc.fileName,
 				})
-				// Separate forecast_base window [winStartMs, observedAtMs] so post-sample requests do not inflate forecast
+				// Separate forecast_base window [winStartMs, observedAtMs] so post-sample requests do not inflate forecast.
+				// Since [winStartMs, observedAtMs] is immutable between 15m lamplighter samples, serve from memory cache when available.
 				if w.observedAtMs > winStartMs && w.observedAtMs < curToMs {
-					forecastBaseTargets = append(forecastBaseTargets, cpampWindowTarget{
-						RequestKey:            fmt.Sprintf("%s|%s|forecast_base", acc.rowKey, w.key),
-						RowKey:                acc.rowKey,
-						WindowKey:             w.key,
-						ProviderWindowID:      w.providerWindowID,
-						Period:                "current",
-						FromMs:                winStartMs,
-						ToMs:                  w.observedAtMs,
-						ModelScope:            scope,
-						AccountSnapshot:       acc.email,
-						AuthLabelSnapshot:     acc.label,
-						AuthFileSnapshot:      acc.fileName,
-						AuthProviderSnapshot:  acc.provider,
-						AuthProjectIDSnapshot: acc.projectID,
-						AuthIndex:             acc.authIndex,
-						Source:                acc.fileName,
-					})
+					fbReqKey := fmt.Sprintf("%s|%s|forecast_base", acc.rowKey, w.key)
+					cacheKey := forecastBaseCacheKey{
+						AccountKey:   accountKey,
+						WindowKey:    w.key,
+						WinStartMs:   winStartMs,
+						ObservedAtMs: w.observedAtMs,
+					}
+					if cachedItem, ok := c.getCachedForecastBase(cacheKey); ok {
+						cachedItem.RequestKey = fbReqKey
+						cachedFBResults[fbReqKey] = cachedItem
+					} else {
+						fbMetaByReqKey[fbReqKey] = fbTargetMeta{
+							cacheKey: cacheKey,
+							usedPct:  100.0 - w.remainingPercent,
+						}
+						forecastBaseTargets = append(forecastBaseTargets, cpampWindowTarget{
+							RequestKey:            fbReqKey,
+							RowKey:                acc.rowKey,
+							WindowKey:             w.key,
+							ProviderWindowID:      w.providerWindowID,
+							Period:                "current",
+							FromMs:                winStartMs,
+							ToMs:                  w.observedAtMs,
+							ModelScope:            scope,
+							AccountSnapshot:       acc.email,
+							AuthLabelSnapshot:     acc.label,
+							AuthFileSnapshot:      acc.fileName,
+							AuthProviderSnapshot:  acc.provider,
+							AuthProjectIDSnapshot: acc.projectID,
+							AuthIndex:             acc.authIndex,
+							Source:                acc.fileName,
+						})
+					}
 				}
 			}
 
@@ -1889,81 +2083,200 @@ func (c *CPACollector) enrichWindowUsage(ctx context.Context, adminKey string, a
 		return code, err
 	}
 
-	results := make(map[string]cpampWindowUsageItem, len(mainResp.Items)+len(forecastBaseTargets))
+	results := make(map[string]cpampWindowUsageItem, len(mainResp.Items)+len(cachedFBResults)+len(forecastBaseTargets))
 	for _, it := range mainResp.Items {
 		if it.RequestKey != "" {
 			results[it.RequestKey] = it
 		}
 	}
+	for k, it := range cachedFBResults {
+		results[k] = it
+	}
 
 	if len(forecastBaseTargets) > 0 {
 		var fbResp cpampWindowUsageResp
 		if _, fbErr := c.doCPAMPJSON(ctx, http.MethodPost, "/v0/management/monitoring/account-window-usage", adminKey, cpampWindowUsageReq{Windows: forecastBaseTargets}, &fbResp); fbErr == nil {
+			now := time.Now()
 			for _, it := range fbResp.Items {
-				if it.RequestKey != "" {
-					results[it.RequestKey] = it
+				if it.RequestKey == "" {
+					continue
+				}
+				results[it.RequestKey] = it
+				if meta, ok := fbMetaByReqKey[it.RequestKey]; ok {
+					validScope := it.Matched && (it.ScopeMatchStatus == "" || it.ScopeMatchStatus == "complete")
+					hasUsage := it.TotalRequests > 0 || it.TotalTokens > 0 || it.TotalCost > 0
+					// Avoid freezing an all-zero base when meaningful quota was already consumed (CPAMP catch-up guard).
+					if validScope && (hasUsage || meta.usedPct <= 0.1) {
+						c.setCachedForecastBase(meta.cacheKey, it, now)
+					}
 				}
 			}
 		}
 	}
 
-	// Apply window usage & CPAMP estimateWindowUsage forecast formula
+	// Apply window usage, robust forecast, post-sample delta & dynamic estimated remaining %
 	for _, acc := range accounts {
 		for i := range acc.windows {
 			w := &acc.windows[i]
-			cur, hasCur := results[fmt.Sprintf("%s|%s|current", acc.rowKey, w.key)]
-			fb, hasFB := results[fmt.Sprintf("%s|%s|forecast_base", acc.rowKey, w.key)]
-			prev, hasPrev := results[fmt.Sprintf("%s|%s|previous", acc.rowKey, w.key)]
-
-			curValid := hasCur && cur.Matched && (cur.ScopeMatchStatus == "" || cur.ScopeMatchStatus == "complete")
-			if curValid {
-				w.currentRequests = cur.TotalRequests
-				w.currentTokens = cur.TotalTokens
-				w.currentCost = cur.TotalCost
-				w.hasCurrentUsage = cur.TotalRequests > 0 || cur.TotalTokens > 0 || cur.TotalCost > 0
+			var curPtr, fbPtr, prevPtr *cpampWindowUsageItem
+			if cur, ok := results[fmt.Sprintf("%s|%s|current", acc.rowKey, w.key)]; ok {
+				cp := cur
+				curPtr = &cp
 			}
-
-			// Determine forecast base (prefer observedAtMs slice to avoid inflating forecast)
-			var base *cpampWindowUsageItem
-			if hasFB && fb.Matched && (fb.ScopeMatchStatus == "" || fb.ScopeMatchStatus == "complete") {
-				fbCopy := fb
-				base = &fbCopy
-			} else if curValid {
-				if w.observedAtMs == 0 || cur.LastSeenMs == 0 || cur.LastSeenMs <= w.observedAtMs {
-					curCopy := cur
-					base = &curCopy
-				}
+			if fb, ok := results[fmt.Sprintf("%s|%s|forecast_base", acc.rowKey, w.key)]; ok {
+				cp := fb
+				fbPtr = &cp
 			}
+			if prev, ok := results[fmt.Sprintf("%s|%s|previous", acc.rowKey, w.key)]; ok {
+				cp := prev
+				prevPtr = &cp
+			}
+			bounds := winBounds[fmt.Sprintf("%s|%s", acc.rowKey, w.key)]
+			applyWindowUsageForecast(w, curPtr, fbPtr, prevPtr, bounds[0], bounds[1])
+		}
+	}
 
-			usedPct := 100.0 - w.remainingPercent
-			if !w.stale && usedPct > 0 && usedPct <= 100 && base != nil && (base.TotalRequests > 0 || base.TotalTokens > 0 || base.TotalCost > 0) {
-				multiplier := 100.0 / usedPct
-				estTokens := int64(math.Round(float64(base.TotalTokens) * multiplier))
-				if curValid && cur.TotalTokens > estTokens {
+	return code, nil
+}
+
+func applyWindowUsageForecast(w *internalCPAWindow, cur, fb, prev *cpampWindowUsageItem, winStartMs, curToMs int64) {
+	curValid := cur != nil && cur.Matched && (cur.ScopeMatchStatus == "" || cur.ScopeMatchStatus == "complete")
+	fbValid := fb != nil && fb.Matched && (fb.ScopeMatchStatus == "" || fb.ScopeMatchStatus == "complete")
+	prevValid := prev != nil && prev.Matched && (prev.ScopeMatchStatus == "" || prev.ScopeMatchStatus == "complete") && (prev.TotalCost >= 0.01 || prev.TotalTokens >= 1000)
+
+	if curValid {
+		w.currentRequests = cur.TotalRequests
+		w.currentTokens = cur.TotalTokens
+		w.currentCost = cur.TotalCost
+		w.hasCurrentUsage = cur.TotalRequests > 0 || cur.TotalTokens > 0 || cur.TotalCost > 0
+	}
+
+	// Determine forecast base (prefer observedAtMs slice to avoid inflating forecast)
+	var base *cpampWindowUsageItem
+	if fbValid {
+		fbCopy := *fb
+		base = &fbCopy
+	} else if curValid {
+		if w.observedAtMs == 0 || (curToMs > 0 && w.observedAtMs >= curToMs) || cur.LastSeenMs == 0 || cur.LastSeenMs <= w.observedAtMs {
+			curCopy := *cur
+			base = &curCopy
+		}
+	}
+
+	// Compute real-time post-sample deltas (since observed_at_ms)
+	if curValid {
+		if fbValid {
+			w.hasPostSampleCheck = true
+			if dc := cur.TotalCost - fb.TotalCost; dc > 0 {
+				w.postSampleCostUSD = dc
+			}
+			if dt := cur.TotalTokens - fb.TotalTokens; dt > 0 {
+				w.postSampleTokens = dt
+			}
+			if dr := cur.TotalRequests - fb.TotalRequests; dr > 0 {
+				w.postSampleRequests = dr
+			}
+		} else if (curToMs > 0 && w.observedAtMs >= curToMs) || cur.TotalRequests == 0 || (w.observedAtMs > 0 && cur.LastSeenMs > 0 && cur.LastSeenMs <= w.observedAtMs) {
+			w.hasPostSampleCheck = true
+		} else if w.observedAtMs > 0 && winStartMs > 0 && w.observedAtMs <= winStartMs && w.remainingPercent >= 99.999 {
+			w.hasPostSampleCheck = true
+			if cur.TotalCost > 0 {
+				w.postSampleCostUSD = cur.TotalCost
+			}
+			if cur.TotalTokens > 0 {
+				w.postSampleTokens = cur.TotalTokens
+			}
+			if cur.TotalRequests > 0 {
+				w.postSampleRequests = cur.TotalRequests
+			}
+		}
+	}
+
+	tryPreviousForecast := func() bool {
+		if !prevValid {
+			return false
+		}
+		estTokens := prev.TotalTokens
+		estCost := round2(prev.TotalCost)
+		if !curValid || (estTokens >= cur.TotalTokens && estCost+1e-9 >= round2(cur.TotalCost)) {
+			w.hasForecast = true
+			w.forecastBasis = "previous"
+			w.forecastTokens = estTokens
+			w.forecastCost = estCost
+			return true
+		}
+		return false
+	}
+
+	usedPct := 100.0 - w.remainingPercent
+	baseHasUsage := base != nil && (base.TotalRequests > 0 || base.TotalTokens > 0 || base.TotalCost > 0)
+
+	if !w.stale {
+		if usedPct >= minQuotaForecastUsedPct && usedPct <= 100 && baseHasUsage {
+			multiplier := 100.0 / usedPct
+			rawEstTokens := int64(math.Round(float64(base.TotalTokens) * multiplier))
+			rawEstCost := round2(base.TotalCost * multiplier)
+			curExceedsEst := curValid && (round2(cur.TotalCost) > rawEstCost+1e-9 || cur.TotalTokens > rawEstTokens)
+
+			if !curExceedsEst {
+				w.hasForecast = true
+				w.forecastBasis = "quota"
+				w.forecastTokens = rawEstTokens
+				w.forecastCost = rawEstCost
+			} else if w.remainingPercent <= nearExhaustedRemainingPct {
+				// Only apply lower-bound clamp max(est, cur) when near exhaustion (<= 1.5% left)
+				estTokens := rawEstTokens
+				if cur.TotalTokens > estTokens {
 					estTokens = cur.TotalTokens
 				}
-				estCost := round2(base.TotalCost * multiplier)
-				if curValid && cur.TotalCost > estCost {
+				estCost := rawEstCost
+				if round2(cur.TotalCost) > estCost {
 					estCost = round2(cur.TotalCost)
 				}
 				w.hasForecast = true
 				w.forecastBasis = "quota"
 				w.forecastTokens = estTokens
 				w.forecastCost = estCost
-			} else if !w.stale && hasPrev && prev.Matched && (prev.ScopeMatchStatus == "" || prev.ScopeMatchStatus == "complete") && (prev.TotalCost >= 0.01 || prev.TotalTokens >= 1000) {
-				estTokens := prev.TotalTokens
-				estCost := round2(prev.TotalCost)
-				if !curValid || (estTokens >= cur.TotalTokens && estCost+1e-9 >= cur.TotalCost) {
-					w.hasForecast = true
-					w.forecastBasis = "previous"
-					w.forecastTokens = estTokens
-					w.forecastCost = estCost
-				}
+			} else {
+				// Avoid self-contradictory "99% left · used $80 · full $80": fall back to previous if reasonable, else omit
+				tryPreviousForecast()
 			}
+		} else {
+			// When usedPct < 0.5% (or base has no usage yet), avoid noisy extrapolation and fall back to previous
+			tryPreviousForecast()
 		}
 	}
 
-	return code, nil
+	// Dynamic post-sample remaining percentage estimate
+	if !w.stale && w.remainingPercent > 0 && (w.postSampleCostUSD > 0 || w.postSampleTokens > 0) {
+		var fullCost float64
+		var fullTokens int64
+		if w.hasForecast && w.forecastBasis == "quota" && usedPct >= minQuotaForecastUsedPct && (w.forecastCost > 0 || w.forecastTokens > 0) {
+			fullCost = w.forecastCost
+			fullTokens = w.forecastTokens
+		} else if prevValid {
+			fullCost = prev.TotalCost
+			fullTokens = prev.TotalTokens
+		}
+
+		var deltaPct float64
+		if w.postSampleCostUSD > 0 && fullCost > 0 {
+			deltaPct = (w.postSampleCostUSD / fullCost) * 100.0
+		} else if w.postSampleTokens > 0 && fullTokens > 0 {
+			deltaPct = (float64(w.postSampleTokens) / float64(fullTokens)) * 100.0
+		}
+
+		if deltaPct > 0 {
+			estRem := w.remainingPercent - deltaPct
+			if estRem < 0 {
+				estRem = 0
+			}
+			if estRem > w.remainingPercent {
+				estRem = w.remainingPercent
+			}
+			w.estimatedRemainingPercent = floatPtr(round3(estRem))
+		}
+	}
 }
 
 func parseRawStringOrInt(raw json.RawMessage) string {
