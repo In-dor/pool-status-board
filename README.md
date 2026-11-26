@@ -8,6 +8,7 @@
 - **CPAMP 同款近期健康条**：复用 `auth-files` 接口 20 × 10 分钟分桶数据（近 200 分钟），三色 RGB 线性插值胶囊条 + 整体成功率与时段详情。
 - **周期燃烧分析图（Cycle Burn Chart）**：内存增量缓存近 36 天 `lamplighter` 采样历史，支持 `5 小时 / 7 天` 窗口与多跨度切换、5 级健康色带时间轴、重置断线平滑曲线、匀速参考线、按当前速度延长线预测，以及桌面悬停与移动端全宽触控读数条。
 - **AIStudio2API 双模式配额核算**：按每日 16:00（北京时间）周期核算全部模型（含 Gemini 文本模型与 Nano Banana 系列画图模型）配额余量与冷却倒计时，并附带本轮分小时消耗趋势柱状图；文本模型采用单账号次数与 Token 双维度短板熔断，画图模型（`tokens: 0`）采用单账号纯按次计额，同时支持模型别名与后缀自动归一化归并。
+- **全链路省流传输**：静态资源启动期预哈希与 `gzip` 预压缩（强 `ETag` / `304`）；`/api/snapshot` 支持按需多档视图（`?view=full|summary|compact|tui`）、一次性预序列化/预 `gzip` 与剥离墙钟时间戳的语义 `ETag`（`W/"snap-<view>-<hash>"` + `X-Generated-At-Ms`）条件请求；`/api/antigravity/history` 支持动态 `gzip` 与语义 `ETag`（`W/"hist-<hash>"` + `X-History-To-Sec`）；网页端后台标签页自动暂停轮询、切回前台即时补拉并按采样指纹按需刷新历史图。
 - **可选口令门禁**：通过 `.env` 中的 `VIEW_PASSCODE` 保护 `/api/snapshot` 与 `/api/antigravity/history`（常量时间比对）。
 
 ## 项目结构

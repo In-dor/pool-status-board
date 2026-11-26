@@ -734,10 +734,8 @@ func (c *AISCollector) Collect(ctx context.Context) AIStudioPool {
 				ModelID:         m.ID,
 				LimitRequests:   lim.Requests,
 				UsedRequests:    usedReq,
-				RawRemRequests:  rawRemReq,
 				LimitTokens:     limitTok,
 				UsedTokens:      usedTok,
-				RawRemTokens:    rawRemTok,
 				CooldownUntilMs: cdUntil,
 			}
 

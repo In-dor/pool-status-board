@@ -268,8 +268,8 @@ func TestAISCollectorRequestOnlyAndDualModeAndAliases(t *testing.T) {
 	if ultraNB21.UsedRequests != 30 || ultraNB21.UsedTokens != 75000000 {
 		t.Errorf("ultra nb21 used req=%d tok=%d, want 30 and 75000000", ultraNB21.UsedRequests, ultraNB21.UsedTokens)
 	}
-	if ultraNB21.LimitTokens != 0 || ultraNB21.RawRemTokens != 0 || ultraNB21.EffectiveRemTokens != 0 {
-		t.Errorf("ultra nb21 token fields = (%d,%d,%d), want (0,0,0)", ultraNB21.LimitTokens, ultraNB21.RawRemTokens, ultraNB21.EffectiveRemTokens)
+	if ultraNB21.LimitTokens != 0 || ultraNB21.EffectiveRemTokens != 0 {
+		t.Errorf("ultra nb21 token fields = (%d,%d), want (0,0)", ultraNB21.LimitTokens, ultraNB21.EffectiveRemTokens)
 	}
 	if ultraNB21.EffectivePercent != 80 {
 		t.Errorf("ultra nb21 effective_percent = %v, want 80", ultraNB21.EffectivePercent)

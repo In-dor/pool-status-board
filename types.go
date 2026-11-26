@@ -71,7 +71,7 @@ type AntigravityAccountHistory struct {
 	RecentSuccessCount  int                       `json:"recent_success_count"`
 	RecentFailureCount  int                       `json:"recent_failure_count"`
 	RecentSuccessRate   *float64                  `json:"recent_success_rate"` // 0..100
-	RecentBars          []AntigravityRecentBar    `json:"recent_bars"`
+	RecentBars          []AntigravityRecentBar    `json:"recent_bars,omitempty"`
 }
 
 type AntigravityRecentBucket struct {
@@ -251,14 +251,210 @@ type AIStudioAccountModel struct {
 	ModelID            string  `json:"model_id"`
 	Status             string  `json:"status"` // available | cooldown | exhausted_requests | exhausted_tokens | auth_required | unavailable | ineligible
 	StatusLabel        string  `json:"status_label"`
-	LimitRequests      int64   `json:"limit_requests"`
-	UsedRequests       int64   `json:"used_requests"`
-	RawRemRequests     int64   `json:"raw_remaining_requests"`
-	EffectiveRemReq    int64   `json:"effective_remaining_requests"`
-	LimitTokens        int64   `json:"limit_tokens"`
-	UsedTokens         int64   `json:"used_tokens"`
-	RawRemTokens       int64   `json:"raw_remaining_tokens"`
-	EffectiveRemTokens int64   `json:"effective_remaining_tokens"`
-	EffectivePercent   float64 `json:"effective_percent"`
+	LimitRequests      int64   `json:"limit_requests,omitempty"`
+	UsedRequests       int64   `json:"used_requests,omitempty"`
+	EffectiveRemReq    int64   `json:"effective_remaining_requests,omitempty"`
+	LimitTokens        int64   `json:"limit_tokens,omitempty"`
+	UsedTokens         int64   `json:"used_tokens,omitempty"`
+	EffectiveRemTokens int64   `json:"effective_remaining_tokens,omitempty"`
+	EffectivePercent   float64 `json:"effective_percent,omitempty"`
 	CooldownUntilMs    int64   `json:"cooldown_until_ms,omitempty"`
+}
+
+// ---------- Projected Snapshot Views (?view=summary|compact|tui) ----------
+
+type snapshotSummaryView struct {
+	GeneratedAtMs          int64                   `json:"generated_at_ms"`
+	RefreshIntervalSeconds int                     `json:"refresh_interval_seconds"`
+	Antigravity            AntigravityPool         `json:"antigravity"`
+	AIStudio               aiStudioPoolSummaryView `json:"aistudio"`
+}
+
+type aiStudioPoolSummaryView struct {
+	Online        bool                   `json:"online"`
+	Status        string                 `json:"status"`
+	StatusMessage string                 `json:"status_message,omitempty"`
+	UpdatedAtMs   int64                  `json:"updated_at_ms"`
+	ServiceState  string                 `json:"service_state"`
+	ServiceReady  bool                   `json:"service_ready"`
+	ActiveReqs    int                    `json:"active_requests"`
+	CycleStartMs  int64                  `json:"cycle_start_ms"`
+	NextResetMs   int64                  `json:"next_reset_ms"`
+	ResetRuleNote string                 `json:"reset_rule_note"`
+	TierCounts    map[string]int         `json:"tier_counts"`
+	AccountCounts AIStudioAccountCounts  `json:"account_counts"`
+	Playground    AIStudioChannelSummary `json:"playground"`
+	HourlyBuckets []AIStudioHourlyBucket `json:"hourly_buckets"`
+	Models        []AIStudioModelSummary `json:"models"`
+}
+
+type snapshotCompactView struct {
+	GeneratedAtMs          int64                   `json:"generated_at_ms"`
+	RefreshIntervalSeconds int                     `json:"refresh_interval_seconds"`
+	Antigravity            AntigravityPool         `json:"antigravity"`
+	AIStudio               aiStudioPoolCompactView `json:"aistudio"`
+}
+
+type aiStudioPoolCompactView struct {
+	Online        bool                   `json:"online"`
+	Status        string                 `json:"status"`
+	StatusMessage string                 `json:"status_message,omitempty"`
+	UpdatedAtMs   int64                  `json:"updated_at_ms"`
+	ServiceState  string                 `json:"service_state"`
+	ServiceReady  bool                   `json:"service_ready"`
+	ActiveReqs    int                    `json:"active_requests"`
+	CycleStartMs  int64                  `json:"cycle_start_ms"`
+	NextResetMs   int64                  `json:"next_reset_ms"`
+	ResetRuleNote string                 `json:"reset_rule_note"`
+	TierCounts    map[string]int         `json:"tier_counts"`
+	AccountCounts AIStudioAccountCounts  `json:"account_counts"`
+	Playground    AIStudioChannelSummary `json:"playground"`
+	Models        []AIStudioModelSummary `json:"models"`
+}
+
+type snapshotTUIView struct {
+	GeneratedAtMs          int64                  `json:"generated_at_ms"`
+	RefreshIntervalSeconds int                    `json:"refresh_interval_seconds"`
+	Antigravity            antigravityPoolTUIView `json:"antigravity"`
+	AIStudio               aiStudioPoolTUIView    `json:"aistudio"`
+}
+
+type antigravityPoolTUIView struct {
+	Online        bool                      `json:"online"`
+	Status        string                    `json:"status"`
+	StatusMessage string                    `json:"status_message,omitempty"`
+	Summary       antigravitySummaryTUIView `json:"summary"`
+	Accounts      []antigravityAccountTUI   `json:"accounts"`
+}
+
+type antigravitySummaryTUIView struct {
+	ActiveAccounts int `json:"active_accounts"`
+}
+
+type antigravityAccountTUI struct {
+	ID       string              `json:"id"`
+	CodeName string              `json:"code_name"`
+	Tier     string              `json:"tier"`
+	Status   string              `json:"status"`
+	Windows  []AntigravityWindow `json:"windows"`
+}
+
+type aiStudioPoolTUIView struct {
+	Online        bool                   `json:"online"`
+	Status        string                 `json:"status"`
+	StatusMessage string                 `json:"status_message,omitempty"`
+	NextResetMs   int64                  `json:"next_reset_ms"`
+	AccountCounts AIStudioAccountCounts  `json:"account_counts"`
+	TierCounts    map[string]int         `json:"tier_counts"`
+	Playground    AIStudioChannelSummary `json:"playground"`
+	Models        []AIStudioModelSummary `json:"models"`
+}
+
+func buildSnapshotSummaryView(snap Snapshot) snapshotSummaryView {
+	hourly := snap.AIStudio.HourlyBuckets
+	if hourly == nil {
+		hourly = []AIStudioHourlyBucket{}
+	}
+	models := snap.AIStudio.Models
+	if models == nil {
+		models = []AIStudioModelSummary{}
+	}
+	return snapshotSummaryView{
+		GeneratedAtMs:          snap.GeneratedAtMs,
+		RefreshIntervalSeconds: snap.RefreshIntervalSeconds,
+		Antigravity:            snap.Antigravity,
+		AIStudio: aiStudioPoolSummaryView{
+			Online:        snap.AIStudio.Online,
+			Status:        snap.AIStudio.Status,
+			StatusMessage: snap.AIStudio.StatusMessage,
+			UpdatedAtMs:   snap.AIStudio.UpdatedAtMs,
+			ServiceState:  snap.AIStudio.ServiceState,
+			ServiceReady:  snap.AIStudio.ServiceReady,
+			ActiveReqs:    snap.AIStudio.ActiveReqs,
+			CycleStartMs:  snap.AIStudio.CycleStartMs,
+			NextResetMs:   snap.AIStudio.NextResetMs,
+			ResetRuleNote: snap.AIStudio.ResetRuleNote,
+			TierCounts:    snap.AIStudio.TierCounts,
+			AccountCounts: snap.AIStudio.AccountCounts,
+			Playground:    snap.AIStudio.Playground,
+			HourlyBuckets: hourly,
+			Models:        models,
+		},
+	}
+}
+
+func buildSnapshotCompactView(snap Snapshot) snapshotCompactView {
+	models := snap.AIStudio.Models
+	if models == nil {
+		models = []AIStudioModelSummary{}
+	}
+	return snapshotCompactView{
+		GeneratedAtMs:          snap.GeneratedAtMs,
+		RefreshIntervalSeconds: snap.RefreshIntervalSeconds,
+		Antigravity:            snap.Antigravity,
+		AIStudio: aiStudioPoolCompactView{
+			Online:        snap.AIStudio.Online,
+			Status:        snap.AIStudio.Status,
+			StatusMessage: snap.AIStudio.StatusMessage,
+			UpdatedAtMs:   snap.AIStudio.UpdatedAtMs,
+			ServiceState:  snap.AIStudio.ServiceState,
+			ServiceReady:  snap.AIStudio.ServiceReady,
+			ActiveReqs:    snap.AIStudio.ActiveReqs,
+			CycleStartMs:  snap.AIStudio.CycleStartMs,
+			NextResetMs:   snap.AIStudio.NextResetMs,
+			ResetRuleNote: snap.AIStudio.ResetRuleNote,
+			TierCounts:    snap.AIStudio.TierCounts,
+			AccountCounts: snap.AIStudio.AccountCounts,
+			Playground:    snap.AIStudio.Playground,
+			Models:        models,
+		},
+	}
+}
+
+func buildSnapshotTUIView(snap Snapshot) snapshotTUIView {
+	accounts := make([]antigravityAccountTUI, 0, len(snap.Antigravity.Accounts))
+	for _, acc := range snap.Antigravity.Accounts {
+		wins := acc.Windows
+		if wins == nil {
+			wins = []AntigravityWindow{}
+		}
+		accounts = append(accounts, antigravityAccountTUI{
+			ID:       acc.ID,
+			CodeName: acc.CodeName,
+			Tier:     acc.Tier,
+			Status:   acc.Status,
+			Windows:  wins,
+		})
+	}
+	models := snap.AIStudio.Models
+	if models == nil {
+		models = []AIStudioModelSummary{}
+	}
+	tierCounts := snap.AIStudio.TierCounts
+	if tierCounts == nil {
+		tierCounts = map[string]int{}
+	}
+	return snapshotTUIView{
+		GeneratedAtMs:          snap.GeneratedAtMs,
+		RefreshIntervalSeconds: snap.RefreshIntervalSeconds,
+		Antigravity: antigravityPoolTUIView{
+			Online:        snap.Antigravity.Online,
+			Status:        snap.Antigravity.Status,
+			StatusMessage: snap.Antigravity.StatusMessage,
+			Summary: antigravitySummaryTUIView{
+				ActiveAccounts: snap.Antigravity.Summary.ActiveAccounts,
+			},
+			Accounts: accounts,
+		},
+		AIStudio: aiStudioPoolTUIView{
+			Online:        snap.AIStudio.Online,
+			Status:        snap.AIStudio.Status,
+			StatusMessage: snap.AIStudio.StatusMessage,
+			NextResetMs:   snap.AIStudio.NextResetMs,
+			AccountCounts: snap.AIStudio.AccountCounts,
+			TierCounts:    tierCounts,
+			Playground:    snap.AIStudio.Playground,
+			Models:        models,
+		},
+	}
 }

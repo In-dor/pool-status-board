@@ -1,15 +1,23 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
 	"io/fs"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +49,14 @@ const (
 	defaultRefreshIntervalSeconds = 15
 	freshMinGapDuration           = 4 * time.Second
 	fileWatchInterval             = 2 * time.Second
+
+	staticGzipMinBytes = 256
+	apiGzipMinBytes    = 512
+
+	snapshotViewFull    = "full"
+	snapshotViewSummary = "summary"
+	snapshotViewCompact = "compact"
+	snapshotViewTUI     = "tui"
 )
 
 func loadConfig() AppConfig {
@@ -74,28 +90,398 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
+func normalizeSnapshotView(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case snapshotViewSummary:
+		return snapshotViewSummary
+	case snapshotViewCompact:
+		return snapshotViewCompact
+	case snapshotViewTUI:
+		return snapshotViewTUI
+	default:
+		return snapshotViewFull
+	}
+}
+
+func gzipBytes(src []byte, level int) ([]byte, error) {
+	var buf bytes.Buffer
+	gw, err := gzip.NewWriterLevel(&buf, level)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := gw.Write(src); err != nil {
+		_ = gw.Close()
+		return nil, err
+	}
+	if err := gw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+var gzipWriterPool = sync.Pool{
+	New: func() any {
+		gw, _ := gzip.NewWriterLevel(io.Discard, gzip.DefaultCompression)
+		return gw
+	},
+}
+
+func gzipBytesPooled(src []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	gw := gzipWriterPool.Get().(*gzip.Writer)
+	gw.Reset(&buf)
+	_, writeErr := gw.Write(src)
+	closeErr := gw.Close()
+	gw.Reset(io.Discard)
+	gzipWriterPool.Put(gw)
+	if writeErr != nil {
+		return nil, writeErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return buf.Bytes(), nil
+}
+
+func acceptsGzip(r *http.Request) bool {
+	for _, hdr := range r.Header.Values("Accept-Encoding") {
+		for _, part := range strings.Split(hdr, ",") {
+			item := strings.TrimSpace(part)
+			if item == "" {
+				continue
+			}
+			coding, params, hasParams := strings.Cut(item, ";")
+			coding = strings.ToLower(strings.TrimSpace(coding))
+			if coding != "gzip" && coding != "x-gzip" {
+				continue
+			}
+			if !hasParams {
+				return true
+			}
+			q := 1.0
+			for _, p := range strings.Split(params, ";") {
+				k, v, ok := strings.Cut(strings.TrimSpace(p), "=")
+				if ok && strings.EqualFold(strings.TrimSpace(k), "q") {
+					if parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+						q = parsed
+					}
+				}
+			}
+			if q > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func normalizeWeakETag(tag string) string {
+	tag = strings.TrimSpace(tag)
+	if strings.HasPrefix(tag, "W/") || strings.HasPrefix(tag, "w/") {
+		tag = strings.TrimSpace(tag[2:])
+	}
+	return tag
+}
+
+func ifNoneMatchMatches(headerVal, currentETag string) bool {
+	headerVal = strings.TrimSpace(headerVal)
+	if headerVal == "" || currentETag == "" {
+		return false
+	}
+	if headerVal == "*" {
+		return true
+	}
+	target := normalizeWeakETag(currentETag)
+	inQuote := false
+	start := 0
+	for i := 0; i <= len(headerVal); i++ {
+		if i < len(headerVal) {
+			if headerVal[i] == '"' && (i == 0 || headerVal[i-1] != '\\') {
+				inQuote = !inQuote
+			}
+			if headerVal[i] != ',' || inQuote {
+				continue
+			}
+		}
+		candidate := strings.TrimSpace(headerVal[start:i])
+		start = i + 1
+		if candidate == "*" {
+			return true
+		}
+		if candidate != "" && normalizeWeakETag(candidate) == target {
+			return true
+		}
+	}
+	return false
+}
+
+func requestMatchesETag(r *http.Request, currentETag string) bool {
+	for _, val := range r.Header.Values("If-None-Match") {
+		if ifNoneMatchMatches(val, currentETag) {
+			return true
+		}
+	}
+	return false
+}
+
+func writeDynamicJSON(w http.ResponseWriter, r *http.Request, raw []byte) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Vary", "Accept-Encoding")
+	if len(raw) >= apiGzipMinBytes && acceptsGzip(r) {
+		if gz, err := gzipBytesPooled(raw); err == nil && len(gz) < len(raw) {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("Content-Length", strconv.Itoa(len(gz)))
+			w.WriteHeader(http.StatusOK)
+			if r.Method != http.MethodHead {
+				_, _ = w.Write(gz)
+			}
+			return
+		}
+	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(raw)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(raw)
+	}
+}
+
+func computeHistorySemanticETag(hist *AntigravityHistoryResponse) (string, error) {
+	sem := *hist
+	sem.FromSec = 0
+	sem.ToSec = 0
+	if len(hist.Series) > 0 {
+		sem.Series = make([]AntigravityHistorySeries, len(hist.Series))
+		for i, s := range hist.Series {
+			sc := s
+			if len(s.EstimatedPoint) >= 2 {
+				// Strip wall-clock timestamp while retaining estimated remaining percentage value
+				sc.EstimatedPoint = []float64{0, s.EstimatedPoint[1]}
+			}
+			sem.Series[i] = sc
+		}
+	}
+	b, err := json.Marshal(sem)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return fmt.Sprintf(`W/"hist-%s"`, hex.EncodeToString(sum[:])[:16]), nil
+}
+
+type cachedSnapshotView struct {
+	rawJSON       []byte
+	gzipJSON      []byte
+	etag          string
+	generatedAtMs int64
+}
+
+func buildCachedSnapshotView(viewName string, payload any, semanticPayload any, generatedAtMs int64) (cachedSnapshotView, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return cachedSnapshotView{}, err
+	}
+	semRaw, err := json.Marshal(semanticPayload)
+	if err != nil {
+		return cachedSnapshotView{}, err
+	}
+	sum := sha256.Sum256(semRaw)
+	etag := fmt.Sprintf(`W/"snap-%s-%s"`, viewName, hex.EncodeToString(sum[:])[:16])
+
+	var gz []byte
+	if len(raw) > 0 {
+		if compressed, gErr := gzipBytes(raw, gzip.BestCompression); gErr == nil && len(compressed) < len(raw) {
+			gz = compressed
+		}
+	}
+	return cachedSnapshotView{
+		rawJSON:       raw,
+		gzipJSON:      gz,
+		etag:          etag,
+		generatedAtMs: generatedAtMs,
+	}, nil
+}
+
 type BoardState struct {
-	mu           sync.RWMutex
-	snapshot     Snapshot
-	snapshotJSON []byte
+	mu       sync.RWMutex
+	snapshot Snapshot
+	views    map[string]cachedSnapshotView
 }
 
 func (b *BoardState) Set(snap Snapshot) {
-	raw, err := json.Marshal(snap)
-	if err != nil {
-		log.Printf("[board] marshal snapshot error: %v", err)
-		return
+	semSnap := snap
+	semSnap.GeneratedAtMs = 0
+	semSnap.Antigravity.UpdatedAtMs = 0
+	semSnap.AIStudio.UpdatedAtMs = 0
+
+	viewSpecs := []struct {
+		name string
+		pub  any
+		sem  any
+	}{
+		{snapshotViewFull, snap, semSnap},
+		{snapshotViewSummary, buildSnapshotSummaryView(snap), buildSnapshotSummaryView(semSnap)},
+		{snapshotViewCompact, buildSnapshotCompactView(snap), buildSnapshotCompactView(semSnap)},
+		{snapshotViewTUI, buildSnapshotTUIView(snap), buildSnapshotTUIView(semSnap)},
 	}
+
+	built := make(map[string]cachedSnapshotView, len(viewSpecs))
+	for _, spec := range viewSpecs {
+		entry, err := buildCachedSnapshotView(spec.name, spec.pub, spec.sem, snap.GeneratedAtMs)
+		if err != nil {
+			log.Printf("[board] marshal snapshot view %s error: %v", spec.name, err)
+			return
+		}
+		built[spec.name] = entry
+	}
+
 	b.mu.Lock()
 	b.snapshot = snap
-	b.snapshotJSON = raw
+	b.views = built
 	b.mu.Unlock()
 }
 
 func (b *BoardState) GetJSON() []byte {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	return b.snapshotJSON
+	if b.views == nil {
+		return nil
+	}
+	return b.views[snapshotViewFull].rawJSON
+}
+
+func (b *BoardState) GetView(view string) (cachedSnapshotView, bool) {
+	norm := normalizeSnapshotView(view)
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.views == nil {
+		return cachedSnapshotView{}, false
+	}
+	entry, ok := b.views[norm]
+	if !ok || len(entry.rawJSON) == 0 {
+		return cachedSnapshotView{}, false
+	}
+	return entry, true
+}
+
+type staticAsset struct {
+	contentType string
+	raw         []byte
+	gzipped     []byte
+	etagRaw     string
+	etagGzip    string
+}
+
+type staticAssetStore struct {
+	files map[string]*staticAsset
+}
+
+func detectStaticContentType(name string, raw []byte) string {
+	switch strings.ToLower(path.Ext(name)) {
+	case ".html", ".htm":
+		return "text/html; charset=utf-8"
+	case ".js", ".mjs":
+		return "text/javascript; charset=utf-8"
+	case ".css":
+		return "text/css; charset=utf-8"
+	case ".svg":
+		return "image/svg+xml"
+	case ".json":
+		return "application/json; charset=utf-8"
+	case ".ico":
+		return "image/x-icon"
+	case ".png":
+		return "image/png"
+	case ".webp":
+		return "image/webp"
+	}
+	if ct := mime.TypeByExtension(path.Ext(name)); ct != "" {
+		return ct
+	}
+	return http.DetectContentType(raw)
+}
+
+func newStaticAssetStore(sub fs.FS) (*staticAssetStore, error) {
+	files := make(map[string]*staticAsset)
+	err := fs.WalkDir(sub, ".", func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		raw, err := fs.ReadFile(sub, p)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(raw)
+		hash16 := hex.EncodeToString(sum[:])[:16]
+		asset := &staticAsset{
+			contentType: detectStaticContentType(p, raw),
+			raw:         raw,
+			etagRaw:     fmt.Sprintf(`"psb-%s"`, hash16),
+		}
+		if len(raw) >= staticGzipMinBytes {
+			if gz, gErr := gzipBytes(raw, gzip.BestCompression); gErr == nil && len(gz) < len(raw) {
+				asset.gzipped = gz
+				asset.etagGzip = fmt.Sprintf(`"psb-%s-gz"`, hash16)
+			}
+		}
+		files[p] = asset
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &staticAssetStore{files: files}, nil
+}
+
+func (s *staticAssetStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	clean := path.Clean("/" + r.URL.Path)
+	rel := strings.TrimPrefix(clean, "/")
+	if rel == "" {
+		rel = "index.html"
+	}
+	asset, ok := s.files[rel]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	useGzip := len(asset.gzipped) > 0 && acceptsGzip(r)
+	etag := asset.etagRaw
+	if useGzip {
+		etag = asset.etagGzip
+	}
+
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Vary", "Accept-Encoding")
+	w.Header().Set("ETag", etag)
+
+	if requestMatchesETag(r, etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	w.Header().Set("Content-Type", asset.contentType)
+	if useGzip {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Length", strconv.Itoa(len(asset.gzipped)))
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(asset.gzipped)
+		}
+		return
+	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(asset.raw)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(asset.raw)
+	}
 }
 
 // RefreshCoordinator serializes snapshot collections (singleflight), supports
@@ -305,97 +691,18 @@ func main() {
 		}
 	}()
 
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-	})
-
-	mux.HandleFunc("GET /api/meta", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"passcode_required":        cfg.ViewPasscode != "",
-			"refresh_interval_seconds": cfg.RefreshIntervalSeconds,
-		})
-	})
-
-	checkPasscode := func(w http.ResponseWriter, r *http.Request) bool {
-		if cfg.ViewPasscode == "" {
-			return true
-		}
-		provided := strings.TrimSpace(r.Header.Get("X-View-Passcode"))
-		if subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.ViewPasscode)) != 1 {
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"error":"passcode_required","message":"请输入访问口令"}`))
-			return false
-		}
-		return true
-	}
-
-	mux.HandleFunc("GET /api/snapshot", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		if !checkPasscode(w, r) {
-			return
-		}
-		freshParam := strings.TrimSpace(r.URL.Query().Get("fresh"))
-		if freshParam == "1" || strings.EqualFold(freshParam, "true") {
-			coordinator.RefreshIfStale(r.Context(), rootCtx)
-		}
-		payload := state.GetJSON()
-		if len(payload) == 0 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(`{"error":"initializing","message":"数据初始化中"}`))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(payload)
-	})
-
-	mux.HandleFunc("GET /api/antigravity/history", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		if !checkPasscode(w, r) {
-			return
-		}
-		q := r.URL.Query()
-		accountID := strings.TrimSpace(q.Get("account"))
-		windowKind := strings.TrimSpace(q.Get("window"))
-		rangeName := strings.TrimSpace(q.Get("range"))
-		if accountID == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"error":"missing_account","message":"缺少账号参数"}`))
-			return
-		}
-		hist, ok := cpa.GetAccountHistory(accountID, windowKind, rangeName)
-		if !ok {
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"error":"not_found","message":"未找到指定账号历史数据"}`))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(hist)
-	})
-
 	subWeb, err := fs.Sub(webFS, "web")
 	if err != nil {
 		log.Fatalf("[board] embed web fs error: %v", err)
 	}
-	fileServer := http.FileServer(http.FS(subWeb))
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		p := r.URL.Path
-		if p == "/" || p == "/index.html" || strings.HasSuffix(p, ".css") || strings.HasSuffix(p, ".js") || strings.HasSuffix(p, ".svg") {
-			w.Header().Set("Cache-Control", "no-cache")
-		}
-		fileServer.ServeHTTP(w, r)
-	})
+	handler, err := newAppHandler(cfg, state, coordinator, cpa, rootCtx, subWeb)
+	if err != nil {
+		log.Fatalf("[board] init handler error: %v", err)
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           securityHeaders(mux),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
@@ -412,6 +719,159 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("[board] server error: %v", err)
 	}
+}
+
+func newAppHandler(
+	cfg AppConfig,
+	state *BoardState,
+	coordinator *RefreshCoordinator,
+	cpa *CPACollector,
+	rootCtx context.Context,
+	subWeb fs.FS,
+) (http.Handler, error) {
+	assets, err := newStaticAssetStore(subWeb)
+	if err != nil {
+		return nil, err
+	}
+
+	mux := http.NewServeMux()
+
+	writeJSONError := func(w http.ResponseWriter, r *http.Request, status int, body string) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(status)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write([]byte(body))
+		}
+	}
+
+	checkPasscode := func(w http.ResponseWriter, r *http.Request) bool {
+		if cfg.ViewPasscode == "" {
+			return true
+		}
+		provided := strings.TrimSpace(r.Header.Get("X-View-Passcode"))
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.ViewPasscode)) != 1 {
+			writeJSONError(w, r, http.StatusUnauthorized, `{"error":"passcode_required","message":"请输入访问口令"}`)
+			return false
+		}
+		return true
+	}
+
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		if r.Method != http.MethodHead {
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		}
+	})
+
+	mux.HandleFunc("GET /api/meta", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		raw, mErr := json.Marshal(map[string]any{
+			"passcode_required":        cfg.ViewPasscode != "",
+			"refresh_interval_seconds": cfg.RefreshIntervalSeconds,
+		})
+		if mErr != nil {
+			writeJSONError(w, r, http.StatusInternalServerError, `{"error":"internal_error"}`)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(raw)))
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(raw)
+		}
+	})
+
+	mux.HandleFunc("GET /api/snapshot", func(w http.ResponseWriter, r *http.Request) {
+		if !checkPasscode(w, r) {
+			return
+		}
+		q := r.URL.Query()
+		freshParam := strings.TrimSpace(q.Get("fresh"))
+		if coordinator != nil && (freshParam == "1" || strings.EqualFold(freshParam, "true")) {
+			coordinator.RefreshIfStale(r.Context(), rootCtx)
+		}
+
+		view := normalizeSnapshotView(q.Get("view"))
+		entry, ok := state.GetView(view)
+		if !ok {
+			writeJSONError(w, r, http.StatusServiceUnavailable, `{"error":"initializing","message":"数据初始化中"}`)
+			return
+		}
+
+		w.Header().Set("Cache-Control", "private, no-store")
+		w.Header().Set("Vary", "Accept-Encoding")
+		w.Header().Set("ETag", entry.etag)
+		w.Header().Set("X-Generated-At-Ms", strconv.FormatInt(entry.generatedAtMs, 10))
+
+		if requestMatchesETag(r, entry.etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if len(entry.gzipJSON) > 0 && acceptsGzip(r) {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("Content-Length", strconv.Itoa(len(entry.gzipJSON)))
+			w.WriteHeader(http.StatusOK)
+			if r.Method != http.MethodHead {
+				_, _ = w.Write(entry.gzipJSON)
+			}
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(entry.rawJSON)))
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(entry.rawJSON)
+		}
+	})
+
+	mux.HandleFunc("GET /api/antigravity/history", func(w http.ResponseWriter, r *http.Request) {
+		if !checkPasscode(w, r) {
+			return
+		}
+		q := r.URL.Query()
+		accountID := strings.TrimSpace(q.Get("account"))
+		windowKind := strings.TrimSpace(q.Get("window"))
+		rangeName := strings.TrimSpace(q.Get("range"))
+		if accountID == "" {
+			writeJSONError(w, r, http.StatusBadRequest, `{"error":"missing_account","message":"缺少账号参数"}`)
+			return
+		}
+		if cpa == nil {
+			writeJSONError(w, r, http.StatusNotFound, `{"error":"not_found","message":"未找到指定账号历史数据"}`)
+			return
+		}
+		hist, ok := cpa.GetAccountHistory(accountID, windowKind, rangeName)
+		if !ok {
+			writeJSONError(w, r, http.StatusNotFound, `{"error":"not_found","message":"未找到指定账号历史数据"}`)
+			return
+		}
+
+		etag, _ := computeHistorySemanticETag(hist)
+		w.Header().Set("Cache-Control", "private, no-store")
+		w.Header().Set("Vary", "Accept-Encoding")
+		w.Header().Set("X-History-To-Sec", strconv.FormatInt(hist.ToSec, 10))
+		if etag != "" {
+			w.Header().Set("ETag", etag)
+			if requestMatchesETag(r, etag) {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+		}
+
+		raw, mErr := json.Marshal(hist)
+		if mErr != nil {
+			writeJSONError(w, r, http.StatusInternalServerError, `{"error":"marshal_error","message":"历史数据序列化失败"}`)
+			return
+		}
+		writeDynamicJSON(w, r, raw)
+	})
+
+	mux.Handle("/", assets)
+
+	return securityHeaders(mux), nil
 }
 
 func securityHeaders(next http.Handler) http.Handler {

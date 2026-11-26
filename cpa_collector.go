@@ -608,11 +608,14 @@ func (c *CPACollector) Collect(ctx context.Context) AntigravityPool {
 			acc.history.RecentWindowFailure = acc.recentWindowFailure
 			acc.history.RecentWindowRate = acc.recentWindowRate
 			acc.history.RecentBuckets = acc.recentBuckets
-		} else if acc.history.RecentBuckets == nil {
-			acc.history.RecentBuckets = []AntigravityRecentBucket{}
-		}
-		if acc.history.RecentBars == nil {
-			acc.history.RecentBars = []AntigravityRecentBar{}
+			acc.history.RecentBars = nil
+		} else {
+			if acc.history.RecentBuckets == nil {
+				acc.history.RecentBuckets = []AntigravityRecentBucket{}
+			}
+			if acc.history.RecentBars == nil {
+				acc.history.RecentBars = []AntigravityRecentBar{}
+			}
 		}
 
 		if acc.history.Available {
@@ -1818,7 +1821,6 @@ func (c *CPACollector) enrichHistory(ctx context.Context, adminKey string, accou
 			FailureCalls:  item.FailureCalls,
 			TotalTokens:   item.TotalTokens,
 			TotalCost:     round2(item.TotalCost),
-			RecentBars:    []AntigravityRecentBar{},
 		}
 		if item.SuccessRate != nil {
 			sr := *item.SuccessRate
@@ -1880,7 +1882,9 @@ func (c *CPACollector) enrichHistory(ctx context.Context, adminKey string, accou
 		if len(bars) > 0 && h.LatestRequestAtMs == 0 {
 			h.LatestRequestAtMs = bars[len(bars)-1].TimestampMs
 		}
-		h.RecentBars = bars
+		if !acc.hasRecentBuckets {
+			h.RecentBars = bars
+		}
 		h.RecentSuccessCount = okCnt
 		h.RecentFailureCount = failCnt
 		if len(bars) > 0 {

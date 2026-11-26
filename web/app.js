@@ -101,7 +101,12 @@
     expandedAisAccounts: new Set(),
     collapsedTrends: loadCollapsedSet(),
     chartPrefs: new Map(),    // accId -> { window, range5h, range7d, selectedGroup, userPickedGroup }
-    historyCache: new Map(),  // "accId|win|range" -> { data, fetchedAt, loading, error }
+    historyCache: new Map(),  // "accId|win|range" -> { data, etag, fetchedAt, fingerprint, loading, error }
+    snapshotEtags: { full: '', summary: '' },
+    snapshotView: '',         // 'full' | 'summary' | ''
+    lastSyncWallMs: 0,
+    agFingerprints: new Map(), // accId -> sampling fingerprint
+    pendingFullFetch: false,
     aisHourlyMetric: safeStorageGet(STORAGE_AIS_METRIC, 'requests') === 'tokens' ? 'tokens' : 'requests',
     aisShowTtft: safeStorageGet(STORAGE_AIS_TTFT, '1') !== '0',
     passcode: safeStorageGet(STORAGE_PASS, ''),
@@ -637,15 +642,135 @@
     el.setAttribute('title', `快照同步于 ${clock} · 每 ${interval} 秒静默刷新（约 ${state.countdown} 秒后）`);
   }
 
-  async function fetchSnapshot(manual = false, fresh = false) {
-    if (state.fetching) return { ok: false, status: 0 };
+  const HISTORY_CACHE_TTL_MS = 5 * 60 * 1000;
+
+  function desiredSnapshotView() {
+    return state.viewMode === 'summary' ? 'summary' : 'full';
+  }
+
+  function needsFullAccountsFetch() {
+    return state.viewMode === 'full'
+      && !!state.snapshot?.aistudio?.online
+      && !Array.isArray(state.snapshot.aistudio.accounts);
+  }
+
+  function accountHistoryFingerprint(acc) {
+    if (!acc) return '';
+    const wins = (acc.windows || [])
+      .map(w => `${w.key}:${w.observed_at_ms || 0}:${w.reset_at_ms || 0}:${w.remaining_percent ?? ''}:${w.stale ? 1 : 0}`)
+      .sort()
+      .join('|');
+    return `${acc.id}|${acc.has_history ? 1 : 0}|${wins}`;
+  }
+
+  function invalidateAccountOtherHistoryEntries(accId, keepKey) {
+    const prefix = `${accId}|`;
+    for (const [key, entry] of state.historyCache.entries()) {
+      if (key.startsWith(prefix) && key !== keepKey && entry) {
+        entry.fetchedAt = 0;
+      }
+    }
+  }
+
+  function syncCachedHistoriesFromSnapshot(snap, onlyTimeBounds = false) {
+    if (!snap) return;
+    const toSec = Math.floor((snap.generated_at_ms || Date.now()) / 1000);
+    if (!(toSec > 0)) return;
+
+    const accountsById = new Map();
+    if (!onlyTimeBounds) {
+      for (const acc of (snap.antigravity?.accounts || [])) {
+        accountsById.set(acc.id, acc);
+      }
+    }
+
+    for (const entry of state.historyCache.values()) {
+      if (!entry || !entry.data) continue;
+      const data = entry.data;
+      const span = Math.max(3600, (data.to_sec || 0) - (data.from_sec || 0));
+      if (toSec > (data.to_sec || 0)) {
+        data.to_sec = toSec;
+        data.from_sec = toSec - span;
+      }
+      const acc = !onlyTimeBounds ? accountsById.get(data.account_id) : null;
+      const winByKey = new Map();
+      if (acc) {
+        for (const w of (acc.windows || [])) {
+          winByKey.set(w.key, w);
+        }
+      }
+
+      for (const s of (data.series || [])) {
+        const pts = s.points || [];
+        const lastPt = pts.length > 0 ? pts[pts.length - 1] : null;
+        if (onlyTimeBounds) {
+          if (Array.isArray(s.estimated_point) && s.estimated_point.length >= 2) {
+            if (lastPt && toSec > lastPt[0] + 20 && (s.reset_sec === 0 || toSec < s.reset_sec)) {
+              s.estimated_point = [toSec, s.estimated_point[1]];
+            }
+          }
+          continue;
+        }
+        const w = winByKey.get(s.key);
+        if (!w) continue;
+        if (typeof w.remaining_percent === 'number' && Number.isFinite(w.remaining_percent)) {
+          s.remaining = w.remaining_percent;
+        }
+        if (w.observed_at_ms > 0) {
+          s.observed_sec = Math.floor(w.observed_at_ms / 1000);
+        }
+        const postReqs = Number(w.post_sample_requests || 0);
+        const postCost = Number(w.post_sample_cost_usd || 0);
+        const postTok = Number(w.post_sample_tokens || 0);
+        const hasEstRem = typeof w.estimated_remaining_percent === 'number' && Number.isFinite(w.estimated_remaining_percent);
+
+        if (!w.stale && lastPt && toSec > lastPt[0] + 20 && lastPt[1] > 0 && (s.reset_sec === 0 || toSec < s.reset_sec)) {
+          if (hasEstRem && w.estimated_remaining_percent < lastPt[1]) {
+            s.estimated_point = [toSec, Math.round(w.estimated_remaining_percent * 1000) / 1000];
+            s.post_sample_requests = postReqs;
+          } else if (postReqs === 0 && postCost === 0 && postTok === 0) {
+            if (s.post_sample_requests != null || snap.antigravity?.cpamp_status === 'ok') {
+              s.post_sample_requests = 0;
+              s.estimated_point = [toSec, lastPt[1]];
+            }
+          } else if (postReqs > 0) {
+            s.post_sample_requests = postReqs;
+            delete s.estimated_point;
+          }
+        } else if (w.stale) {
+          delete s.estimated_point;
+        }
+      }
+    }
+  }
+
+  async function fetchSnapshot(manual = false, fresh = false, opts = {}) {
+    if (state.fetching) {
+      if (opts.forceView === 'full') state.pendingFullFetch = true;
+      return { ok: false, status: 0 };
+    }
     state.fetching = true;
     if (manual) setRefreshSpinning(true);
 
+    const view = opts.forceView || desiredSnapshotView();
+
     try {
-      const url = fresh ? '/api/snapshot?fresh=1' : '/api/snapshot';
-      const resp = await fetch(url, { headers: authHeaders(), cache: 'no-store' });
+      const qs = new URLSearchParams();
+      if (view === 'summary') qs.set('view', 'summary');
+      if (fresh) qs.set('fresh', '1');
+      const query = qs.toString();
+      const url = query ? `/api/snapshot?${query}` : '/api/snapshot';
+
+      const headers = authHeaders();
+      const canUseEtag = !opts.bypassIfNoneMatch && !!state.snapshot && state.snapshotView === view && !!state.snapshotEtags[view];
+      if (canUseEtag) {
+        headers['If-None-Match'] = state.snapshotEtags[view];
+      }
+
+      const resp = await fetch(url, { headers, cache: 'no-store' });
       if (resp.status === 401) {
+        state.snapshotEtags = { full: '', summary: '' };
+        state.snapshotView = '';
         const hadSaved = !!safeStorageGet(STORAGE_PASS, '');
         if (!manual && hadSaved) {
           safeStorageRemove(STORAGE_PASS);
@@ -656,11 +781,45 @@
         }
         return { ok: false, status: 401 };
       }
+
+      if (resp.status === 304 && state.snapshot) {
+        const nextEtag = resp.headers.get('ETag');
+        if (nextEtag) state.snapshotEtags[view] = nextEtag;
+        const headerGenMs = Number(resp.headers.get('X-Generated-At-Ms'));
+        if (Number.isFinite(headerGenMs) && headerGenMs > 0) {
+          state.snapshot.generated_at_ms = headerGenMs;
+        }
+        state.lastSyncWallMs = Date.now();
+        state.countdown = pollIntervalSeconds();
+        syncCachedHistoriesFromSnapshot(state.snapshot, true);
+        if (manual) {
+          await refreshVisibleHistories(true, { skipRender: false });
+          flashJustSynced();
+        }
+        return { ok: true, status: 304 };
+      }
+
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
 
+      const nextEtag = resp.headers.get('ETag') || '';
       const nextSnap = await resp.json();
-      const prevTs = state.snapshot ? state.snapshot.generated_at_ms : 0;
+      const hadPrev = !!state.snapshot;
+
+      const changedHistoryAccIds = new Set();
+      const nextFingerprints = new Map();
+      for (const acc of (nextSnap.antigravity?.accounts || [])) {
+        const fp = accountHistoryFingerprint(acc);
+        nextFingerprints.set(acc.id, fp);
+        if (hadPrev && state.agFingerprints.get(acc.id) !== fp) {
+          changedHistoryAccIds.add(acc.id);
+        }
+      }
+      state.agFingerprints = nextFingerprints;
+
       state.snapshot = nextSnap;
+      state.snapshotView = view;
+      if (nextEtag) state.snapshotEtags[view] = nextEtag;
+      state.lastSyncWallMs = Date.now();
       if (nextSnap.refresh_interval_seconds > 0) {
         state.meta.refresh_interval_seconds = nextSnap.refresh_interval_seconds;
       }
@@ -674,25 +833,28 @@
 
       if (state.gateOpen) showShell();
 
-      // Flicker-free silent polling + synchronized left/right history updates:
-      // Whenever snapshot timestamp changes (or manual refresh), force-sync visible histories
-      // so left quota cards and right burn chart update in lockstep with zero tear.
-      const snapChanged = !prevTs || prevTs !== nextSnap.generated_at_ms;
-      const shouldRenderDOM = manual || snapChanged;
-      if (shouldRenderDOM) {
-        if (prevTs > 0) {
+      // Mark cached secondary ranges stale only for accounts whose sampling fingerprint changed
+      for (const accId of changedHistoryAccIds) {
+        const pref = getChartPref(accId);
+        invalidateAccountOtherHistoryEntries(accId, historyCacheKey(accId, pref.window, currentRangeOf(pref)));
+      }
+
+      // Sync post-sample live estimates & time bounds into cached history without extra HTTP requests
+      syncCachedHistoriesFromSnapshot(nextSnap, false);
+
+      // Only refetch /api/antigravity/history on manual refresh or real sampling fingerprint change
+      if (hadPrev) {
+        if (manual) {
           await refreshVisibleHistories(true, { skipRender: true });
+        } else if (changedHistoryAccIds.size > 0) {
+          await refreshVisibleHistories(true, { skipRender: true, onlyAccIds: changedHistoryAccIds });
         }
-        const savedScrollY = window.scrollY;
-        render();
-        if (Math.abs(window.scrollY - savedScrollY) > 2) {
-          window.scrollTo(0, savedScrollY);
-        }
-        if (!prevTs) {
-          refreshVisibleHistories(true);
-        }
-      } else {
-        renderTopBadges();
+      }
+
+      const savedScrollY = window.scrollY;
+      render();
+      if (Math.abs(window.scrollY - savedScrollY) > 2) {
+        window.scrollTo(0, savedScrollY);
       }
 
       if (manual) flashJustSynced();
@@ -709,6 +871,12 @@
       state.fetching = false;
       setRefreshSpinning(false);
       updateSyncMeta();
+      if (state.pendingFullFetch) {
+        state.pendingFullFetch = false;
+        if (needsFullAccountsFetch()) {
+          setTimeout(() => fetchSnapshot(false, false, { forceView: 'full', bypassIfNoneMatch: true }), 0);
+        }
+      }
     }
   }
 
@@ -716,39 +884,94 @@
     const key = historyCacheKey(accId, win, range);
     const cached = state.historyCache.get(key);
     const now = Date.now();
-    const ttlMs = Math.max(10_000, (pollIntervalSeconds() - 1) * 1000);
-    if (!force && cached && cached.data && now - cached.fetchedAt < ttlMs) {
+    const curFp = state.agFingerprints.get(accId) || '';
+    if (
+      !force
+      && cached
+      && cached.data
+      && cached.fetchedAt > 0
+      && now - cached.fetchedAt < HISTORY_CACHE_TTL_MS
+      && cached.fingerprint === curFp
+    ) {
       return cached.data;
     }
     if (!force && cached && cached.loading) return cached.data || null;
 
     state.historyCache.set(key, {
       data: cached?.data || null,
+      etag: cached?.etag || '',
       fetchedAt: cached?.fetchedAt || 0,
+      fingerprint: cached?.fingerprint || '',
       loading: true,
       error: null,
     });
 
     try {
       const qs = new URLSearchParams({ account: accId, window: win, range });
+      const headers = authHeaders();
+      if (cached?.etag && cached?.data) {
+        headers['If-None-Match'] = cached.etag;
+      }
       const resp = await fetch(`/api/antigravity/history?${qs.toString()}`, {
-        headers: authHeaders(),
+        headers,
         cache: 'no-store',
       });
       if (resp.status === 401) {
         showGate('访问口令验证已过期，请重新输入');
-        state.historyCache.set(key, { data: cached?.data || null, fetchedAt: 0, loading: false, error: '需要口令' });
+        state.historyCache.set(key, {
+          data: cached?.data || null,
+          etag: '',
+          fetchedAt: 0,
+          fingerprint: '',
+          loading: false,
+          error: '需要口令',
+        });
         return null;
       }
+      if (resp.status === 304 && cached?.data) {
+        const nextEtag = resp.headers.get('ETag') || cached.etag || '';
+        const toSec = Number(resp.headers.get('X-History-To-Sec'));
+        if (Number.isFinite(toSec) && toSec > 0) {
+          const span = Math.max(3600, (cached.data.to_sec || 0) - (cached.data.from_sec || 0));
+          cached.data.to_sec = toSec;
+          cached.data.from_sec = toSec - span;
+          for (const s of (cached.data.series || [])) {
+            if (Array.isArray(s.estimated_point) && s.estimated_point.length >= 2) {
+              s.estimated_point = [toSec, s.estimated_point[1]];
+            }
+          }
+        }
+        state.historyCache.set(key, {
+          data: cached.data,
+          etag: nextEtag,
+          fetchedAt: Date.now(),
+          fingerprint: curFp,
+          loading: false,
+          error: null,
+        });
+        if (state.snapshot) syncCachedHistoriesFromSnapshot(state.snapshot, false);
+        if (!opts.skipRender) renderAccountHistoryPanel(accId);
+        return cached.data;
+      }
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const nextEtag = resp.headers.get('ETag') || '';
       const data = await resp.json();
-      state.historyCache.set(key, { data, fetchedAt: Date.now(), loading: false, error: null });
+      state.historyCache.set(key, {
+        data,
+        etag: nextEtag,
+        fetchedAt: Date.now(),
+        fingerprint: curFp,
+        loading: false,
+        error: null,
+      });
       if (!opts.skipRender) renderAccountHistoryPanel(accId);
       return data;
     } catch {
       state.historyCache.set(key, {
         data: cached?.data || null,
+        etag: cached?.etag || '',
         fetchedAt: cached?.fetchedAt || 0,
+        fingerprint: cached?.fingerprint || '',
         loading: false,
         error: '历史数据暂不可用',
       });
@@ -761,9 +984,11 @@
     const ag = state.snapshot?.antigravity;
     if (!ag || !ag.accounts) return;
     const isSingle = ag.accounts.length === 1;
+    const onlyAccIds = opts.onlyAccIds || null;
     const jobs = [];
     for (const acc of ag.accounts) {
       if (!acc.has_history) continue;
+      if (onlyAccIds && !onlyAccIds.has(acc.id)) continue;
       if (!isSingle && state.collapsedTrends.has(acc.id)) continue;
       const pref = getChartPref(acc.id);
       jobs.push(fetchAccountHistory(acc.id, pref.window, currentRangeOf(pref), force, opts));
@@ -3800,17 +4025,30 @@
 
   function isAccountModelFullZero(m) {
     const hasTokenLimit = (m.limit_tokens || 0) > 0;
+    const effPct = m.effective_percent || 0;
     return (
       m.status === 'available' &&
-      m.effective_percent >= 100 - LEVEL_EPSILON &&
-      !(m.used_requests > 0) &&
-      (!hasTokenLimit || !(m.used_tokens > 0))
+      effPct >= 100 - LEVEL_EPSILON &&
+      !((m.used_requests || 0) > 0) &&
+      (!hasTokenLimit || !((m.used_tokens || 0) > 0))
     );
   }
 
   function renderAISAccountDetails(ais) {
+    if (!Array.isArray(ais.accounts)) {
+      return `
+        <div>
+          <div class="filter-bar">
+            <div class="filter-left">
+              <span class="card-title">单号脱敏明细</span>
+            </div>
+          </div>
+          <div class="empty-box">正在加载单号脱敏明细…</div>
+        </div>
+      `;
+    }
     const models = ais.models || [];
-    const accounts = ais.accounts || [];
+    const accounts = ais.accounts;
     const tierCounts = ais.tier_counts || {};
     const issuesCount = accounts.filter(isAccountIssue).length;
 
@@ -3912,11 +4150,18 @@
           </div>
         </div>`;
       } else {
-        const isEmpty = quotaLevel(m.effective_percent) === 'empty';
-        const hasTokenLimit = (m.limit_tokens || 0) > 0;
+        const effPct = m.effective_percent || 0;
+        const limReq = m.limit_requests || 0;
+        const usedReq = m.used_requests || 0;
+        const effRemReq = m.effective_remaining_requests || 0;
+        const limTok = m.limit_tokens || 0;
+        const usedTok = m.used_tokens || 0;
+        const effRemTok = m.effective_remaining_tokens || 0;
+        const isEmpty = quotaLevel(effPct) === 'empty';
+        const hasTokenLimit = limTok > 0;
         const focusTokenSpan = hasTokenLimit
-          ? `<span>Token ${fmtCompact(m.effective_remaining_tokens)} / ${fmtCompact(m.limit_tokens)}</span>`
-          : `<span style="color:var(--text-3);">${(m.used_tokens || 0) > 0 ? `按次计额 · 已耗 ${fmtCompact(m.used_tokens)} tok` : '按次计额'}</span>`;
+          ? `<span>Token ${fmtCompact(effRemTok)} / ${fmtCompact(limTok)}</span>`
+          : `<span style="color:var(--text-3);">${usedTok > 0 ? `按次计额 · 已耗 ${fmtCompact(usedTok)} tok` : '按次计额'}</span>`;
         const cdLine = m.cooldown_until_ms && m.status === 'cooldown'
           ? `<div style="font-size:11.5px;color:var(--amber-text)">冷却恢复：<span class="cd-target num" data-ts="${m.cooldown_until_ms}" data-suffix="后恢复">${fmtCountdown(m.cooldown_until_ms, '后恢复')}</span></div>`
           : '';
@@ -3928,12 +4173,12 @@
             </div>
             <div class="prog-row">
               <div class="bar-track ${isEmpty ? 'is-empty' : ''}">
-                <div class="bar-fill ${barColorClass(m.effective_percent)}" style="width:${Math.max(0, Math.min(100, m.effective_percent))}%"></div>
+                <div class="bar-fill ${barColorClass(effPct)}" style="width:${Math.max(0, Math.min(100, effPct))}%"></div>
               </div>
-              <span class="prog-pct num" style="color:${pctTextColor(m.effective_percent)}">${fmtPct(m.effective_percent, 1)}</span>
+              <span class="prog-pct num" style="color:${pctTextColor(effPct)}">${fmtPct(effPct, 1)}</span>
             </div>
             <div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--text-2);flex-wrap:wrap;gap:4px;" class="num">
-              <span>次数 ${fmtInt(m.effective_remaining_requests)} / ${fmtInt(m.limit_requests)}（已用 ${fmtInt(m.used_requests)}）</span>
+              <span>次数 ${fmtInt(effRemReq)} / ${fmtInt(limReq)}（已用 ${fmtInt(usedReq)}）</span>
               ${focusTokenSpan}
             </div>
             ${cdLine}
@@ -3953,15 +4198,21 @@
 
       const rows = visible.map(m => {
         const friendly = modelLabelMap.get(m.model_id) || m.model_id;
-        const isEmpty = quotaLevel(m.effective_percent) === 'empty';
+        const effPct = m.effective_percent || 0;
+        const limReq = m.limit_requests || 0;
+        const effRemReq = m.effective_remaining_requests || 0;
+        const limTok = m.limit_tokens || 0;
+        const usedTok = m.used_tokens || 0;
+        const effRemTok = m.effective_remaining_tokens || 0;
+        const isEmpty = quotaLevel(effPct) === 'empty';
         let rightCol = '';
         if (m.status === 'available') {
           rightCol = `
             <div class="ais-m-bar-cell">
               <div class="bar-track bar-track-sm ${isEmpty ? 'is-empty' : ''}">
-                <div class="bar-fill ${barColorClass(m.effective_percent)}" style="width:${Math.max(0, Math.min(100, m.effective_percent))}%"></div>
+                <div class="bar-fill ${barColorClass(effPct)}" style="width:${Math.max(0, Math.min(100, effPct))}%"></div>
               </div>
-              <span class="ais-m-pct num" style="color:${pctTextColor(m.effective_percent)}">${fmtRoundPct(m.effective_percent)}</span>
+              <span class="ais-m-pct num" style="color:${pctTextColor(effPct)}">${fmtRoundPct(effPct)}</span>
             </div>
           `;
         } else if (m.status === 'cooldown' && m.cooldown_until_ms) {
@@ -3970,15 +4221,15 @@
           rightCol = `<span class="badge ${statusBadgeClass(m.status)}" style="font-size:10px;padding:1px 6px;">${esc(m.status_label)}</span>`;
         }
 
-        const hasTokenLimit = (m.limit_tokens || 0) > 0;
+        const hasTokenLimit = limTok > 0;
         const rowTitle = hasTokenLimit
-          ? `${friendly} (${m.model_id}): 剩余次数 ${m.effective_remaining_requests}/${m.limit_requests}, 剩余 Token ${fmtCompact(m.effective_remaining_tokens)}/${fmtCompact(m.limit_tokens)}`
-          : `${friendly} (${m.model_id}): 剩余次数 ${m.effective_remaining_requests}/${m.limit_requests}（按次计额${(m.used_tokens || 0) > 0 ? `，已耗 ${fmtCompact(m.used_tokens)} tok` : ''}）`;
+          ? `${friendly} (${m.model_id}): 剩余次数 ${effRemReq}/${limReq}, 剩余 Token ${fmtCompact(effRemTok)}/${fmtCompact(limTok)}`
+          : `${friendly} (${m.model_id}): 剩余次数 ${effRemReq}/${limReq}（按次计额${usedTok > 0 ? `，已耗 ${fmtCompact(usedTok)} tok` : ''}）`;
         const rowNums = hasTokenLimit
-          ? `${fmtInt(m.effective_remaining_requests)}次 · ${fmtCompact(m.effective_remaining_tokens)}`
-          : ((m.used_tokens || 0) > 0
-              ? `${fmtInt(m.effective_remaining_requests)}次 · 已耗 ${fmtCompact(m.used_tokens)} tok`
-              : `${fmtInt(m.effective_remaining_requests)}/${fmtInt(m.limit_requests)}次`);
+          ? `${fmtInt(effRemReq)}次 · ${fmtCompact(effRemTok)}`
+          : (usedTok > 0
+              ? `${fmtInt(effRemReq)}次 · 已耗 ${fmtCompact(usedTok)} tok`
+              : `${fmtInt(effRemReq)}/${fmtInt(limReq)}次`);
 
         return `
           <div class="ais-m-row" title="${esc(rowTitle)}">
@@ -4148,6 +4399,9 @@
           syncViewButtons();
         }
         render();
+        if (needsFullAccountsFetch()) {
+          fetchSnapshot(false, false, { forceView: 'full', bypassIfNoneMatch: true });
+        }
       });
     });
 
@@ -4224,6 +4478,9 @@
         safeStorageSet(STORAGE_VIEW, 'full');
         syncViewButtons();
         render();
+        if (needsFullAccountsFetch()) {
+          fetchSnapshot(false, false, { forceView: 'full', bypassIfNoneMatch: true });
+        }
       });
     }
 
@@ -4315,10 +4572,50 @@
         if (state.snapshot && !state.gateOpen) redrawVisibleCharts();
       }, 140);
     });
+
+    // Zero-traffic background pause + instant foreground catch-up
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') return;
+      if (state.gateOpen) return;
+      updateLiveCountdowns();
+      const intervalMs = pollIntervalSeconds() * 1000;
+      const elapsedMs = state.lastSyncWallMs > 0 ? (Date.now() - state.lastSyncWallMs) : Infinity;
+      if (!state.snapshot || elapsedMs >= intervalMs) {
+        state.countdown = pollIntervalSeconds();
+        updateSyncMeta();
+        fetchSnapshot(false, false);
+      } else {
+        state.countdown = Math.max(1, Math.ceil((intervalMs - elapsedMs) / 1000));
+        updateSyncMeta();
+      }
+    });
+  }
+
+  function updateLiveCountdowns() {
+    document.querySelectorAll('.cd-target').forEach(el => {
+      const ts = Number(el.getAttribute('data-ts'));
+      if (!(ts > 0)) return;
+      const prefix = el.getAttribute('data-prefix') ?? '';
+      if (el.getAttribute('data-compact') === '1') {
+        el.textContent = prefix + fmtCompactCountdown(ts);
+      } else {
+        const suffix = el.getAttribute('data-suffix') ?? '';
+        el.textContent = prefix + fmtCountdown(ts, suffix);
+      }
+    });
+    document.querySelectorAll('.age-target').forEach(el => {
+      const ts = Number(el.getAttribute('data-obs-ts'));
+      if (ts > 0) el.textContent = fmtSampleAge(ts);
+    });
+    document.querySelectorAll('.cd-hms').forEach(el => {
+      const ts = Number(el.getAttribute('data-ts'));
+      if (ts > 0) el.textContent = fmtHMS(ts);
+    });
   }
 
   // ---------- 1s Live Countdown Tick & Meta-Synced Silent Polling ----------
   setInterval(() => {
+    if (document.visibilityState === 'hidden') return;
     if (state.snapshot && !state.gateOpen) {
       state.countdown--;
       if (state.countdown <= 0) {
@@ -4328,25 +4625,7 @@
       updateSyncMeta();
     }
     if (!state.gateOpen) {
-      document.querySelectorAll('.cd-target').forEach(el => {
-        const ts = Number(el.getAttribute('data-ts'));
-        if (!(ts > 0)) return;
-        const prefix = el.getAttribute('data-prefix') ?? '';
-        if (el.getAttribute('data-compact') === '1') {
-          el.textContent = prefix + fmtCompactCountdown(ts);
-        } else {
-          const suffix = el.getAttribute('data-suffix') ?? '';
-          el.textContent = prefix + fmtCountdown(ts, suffix);
-        }
-      });
-      document.querySelectorAll('.age-target').forEach(el => {
-        const ts = Number(el.getAttribute('data-obs-ts'));
-        if (ts > 0) el.textContent = fmtSampleAge(ts);
-      });
-      document.querySelectorAll('.cd-hms').forEach(el => {
-        const ts = Number(el.getAttribute('data-ts'));
-        if (ts > 0) el.textContent = fmtHMS(ts);
-      });
+      updateLiveCountdowns();
     }
   }, 1000);
 
