@@ -248,9 +248,9 @@ func TestStaticAssetsGzipETagAnd304(t *testing.T) {
 	}{
 		{"/", "index.html"},
 		{"/index.html", "index.html"},
-		{"/app.js?v=20261126-2", "app.js"},
-		{"/styles.css?v=20261126-2", "styles.css"},
-		{"/favicon.svg?v=20261126-2", "favicon.svg"},
+		{"/app.js?v=20261126-3", "app.js"},
+		{"/styles.css?v=20261126-3", "styles.css"},
+		{"/favicon.svg?v=20261126-3", "favicon.svg"},
 	}
 
 	for _, tc := range paths {

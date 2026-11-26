@@ -192,38 +192,362 @@
     return 'var(--text-2)';
   }
 
-  function buildCacheHitTitle(h) {
+  // ---------- Unified Touch-Tap & Desktop-Hover Popover Tooltip (#ui-pop-tip) ----------
+  function tipAttrs(tipId, tipTitle, tipBody) {
+    const body = String(tipBody || '').trim();
+    if (!body) return '';
+    const title = String(tipTitle || '').trim();
+    const aria = title ? `${title}：${body}` : body;
+    return ` data-tip="${esc(body)}" data-tip-title="${esc(title)}" data-tip-id="${esc(tipId)}" aria-label="${esc(aria)}"`;
+  }
+
+  function tipElAttrs(baseClass, tipId, tipTitle, tipBody) {
+    const body = String(tipBody || '').trim();
+    const cls = body ? (baseClass ? `${baseClass} has-tip` : 'has-tip') : baseClass;
+    return `class="${esc(cls)}"${tipAttrs(tipId, tipTitle, body)}`;
+  }
+
+  const popTipState = {
+    el: null,
+    titleEl: null,
+    bodyEl: null,
+    closeBtn: null,
+    target: null,
+    activeTipId: '',
+    pinned: false,
+    pinnedAt: 0,
+  };
+
+  function ensurePopTipEl() {
+    if (popTipState.el && popTipState.el.isConnected) return popTipState.el;
+    let el = document.getElementById('ui-pop-tip');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'ui-pop-tip';
+      el.className = 'ui-pop-tip';
+      el.setAttribute('role', 'tooltip');
+      el.hidden = true;
+      el.innerHTML = `
+        <div class="ui-pop-tip-content">
+          <div class="ui-pop-tip-title" hidden></div>
+          <div class="ui-pop-tip-body"></div>
+        </div>
+        <button type="button" class="ui-pop-tip-close" aria-label="关闭提示" hidden>×</button>
+      `;
+      document.body.appendChild(el);
+    }
+    popTipState.el = el;
+    popTipState.titleEl = el.querySelector('.ui-pop-tip-title');
+    popTipState.bodyEl = el.querySelector('.ui-pop-tip-body');
+    popTipState.closeBtn = el.querySelector('.ui-pop-tip-close');
+    return el;
+  }
+
+  function syncPopTipContent(target) {
+    if (!target) return false;
+    const body = (target.getAttribute('data-tip') || '').trim();
+    if (!body) return false;
+    const title = (target.getAttribute('data-tip-title') || '').trim();
+    ensurePopTipEl();
+    if (popTipState.titleEl) {
+      popTipState.titleEl.textContent = title;
+      popTipState.titleEl.hidden = !title;
+    }
+    if (popTipState.bodyEl) {
+      popTipState.bodyEl.textContent = body;
+    }
+    if (popTipState.closeBtn) {
+      popTipState.closeBtn.hidden = !popTipState.pinned;
+    }
+    popTipState.el.classList.toggle('is-pinned', popTipState.pinned);
+    return true;
+  }
+
+  function positionPopTip() {
+    const el = popTipState.el;
+    const target = popTipState.target;
+    if (!el || el.hidden || !target || !target.isConnected) return;
+
+    const rect = target.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) {
+      hidePopTip();
+      return;
+    }
+
+    const vw = window.innerWidth || document.documentElement.clientWidth || 360;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 640;
+    const pad = 8;
+    const gap = 8;
+
+    // Reset offset before measuring so max-width computes without shrink-wrap bias
+    el.style.left = '0px';
+    el.style.top = '0px';
+
+    const tipW = el.offsetWidth;
+    const tipH = el.offsetHeight;
+
+    let left = rect.left + rect.width / 2 - tipW / 2;
+    const maxLeft = Math.max(pad, vw - tipW - pad);
+    left = Math.max(pad, Math.min(maxLeft, left));
+
+    let top = rect.top - tipH - gap;
+    let placement = 'top';
+    if (top < pad) {
+      const belowTop = rect.bottom + gap;
+      top = Math.min(belowTop, Math.max(pad, vh - tipH - pad));
+      placement = 'bottom';
+    }
+
+    el.style.left = Math.round(left) + 'px';
+    el.style.top = Math.round(top) + 'px';
+    el.dataset.placement = placement;
+  }
+
+  function hidePopTip() {
+    if (popTipState.target) {
+      popTipState.target.classList.remove('is-tip-open');
+    }
+    popTipState.target = null;
+    popTipState.activeTipId = '';
+    popTipState.pinned = false;
+    popTipState.pinnedAt = 0;
+    if (popTipState.el) {
+      popTipState.el.hidden = true;
+      popTipState.el.classList.remove('is-pinned');
+    }
+    if (popTipState.closeBtn) {
+      popTipState.closeBtn.hidden = true;
+    }
+  }
+
+  function showPopTip(target, pinned = false) {
+    if (!target || !target.isConnected) return;
+    const body = (target.getAttribute('data-tip') || '').trim();
+    if (!body) {
+      hidePopTip();
+      return;
+    }
+    if (popTipState.target && popTipState.target !== target) {
+      popTipState.target.classList.remove('is-tip-open');
+    }
+    popTipState.target = target;
+    popTipState.activeTipId = target.getAttribute('data-tip-id') || '';
+    popTipState.pinned = !!pinned;
+    popTipState.pinnedAt = pinned ? Date.now() : 0;
+
+    target.classList.add('is-tip-open');
+    const el = ensurePopTipEl();
+    syncPopTipContent(target);
+    el.hidden = false;
+    positionPopTip();
+  }
+
+  function restorePopTipAfterRender() {
+    if (!popTipState.activeTipId) return;
+    const nextTarget = document.querySelector(`[data-tip-id="${CSS.escape(popTipState.activeTipId)}"]`);
+    if (!nextTarget || !(nextTarget.getAttribute('data-tip') || '').trim()) {
+      hidePopTip();
+      return;
+    }
+    if (popTipState.target && popTipState.target !== nextTarget) {
+      popTipState.target.classList.remove('is-tip-open');
+    }
+    popTipState.target = nextTarget;
+    nextTarget.classList.add('is-tip-open');
+    const el = ensurePopTipEl();
+    syncPopTipContent(nextTarget);
+    el.hidden = false;
+    positionPopTip();
+  }
+
+  function bindPopTipEvents() {
+    ensurePopTipEl();
+
+    // Desktop mouse hover (only when not pinned to another element)
+    document.addEventListener('pointerover', (e) => {
+      if (e.pointerType !== 'mouse') return;
+      const trigger = e.target && e.target.closest ? e.target.closest('[data-tip]') : null;
+      if (!trigger) return;
+      if (popTipState.pinned && popTipState.target !== trigger) return;
+      if (popTipState.target === trigger && popTipState.el && !popTipState.el.hidden) return;
+      showPopTip(trigger, false);
+    });
+
+    document.addEventListener('pointerout', (e) => {
+      if (e.pointerType !== 'mouse') return;
+      if (popTipState.pinned || !popTipState.target) return;
+      const leaving = e.target && e.target.closest ? e.target.closest('[data-tip]') : null;
+      if (!leaving || leaving !== popTipState.target) return;
+      const related = e.relatedTarget;
+      if (related && leaving.contains(related)) return;
+      hidePopTip();
+    });
+
+    // Touch tap / click delegation (toggle pin, switch targets, never hijack <a> links)
+    document.addEventListener('click', (e) => {
+      const targetNode = e.target;
+      if (targetNode && targetNode.closest && targetNode.closest('.ui-pop-tip-close')) {
+        e.stopPropagation();
+        hidePopTip();
+        return;
+      }
+      if (popTipState.el && !popTipState.el.hidden && popTipState.el.contains(targetNode)) {
+        return;
+      }
+      const trigger = targetNode && targetNode.closest ? targetNode.closest('[data-tip]') : null;
+      if (trigger) {
+        if (targetNode.closest('a')) {
+          hidePopTip();
+          return;
+        }
+        if (popTipState.pinned && popTipState.target === trigger) {
+          hidePopTip();
+          return;
+        }
+        showPopTip(trigger, true);
+        return;
+      }
+      if (popTipState.target) {
+        hidePopTip();
+      }
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && popTipState.target) {
+        hidePopTip();
+      }
+    });
+
+    // Close on scroll with 150ms tap-jitter guard
+    window.addEventListener('scroll', () => {
+      if (!popTipState.target) return;
+      if (popTipState.pinned && (Date.now() - popTipState.pinnedAt) < 150) return;
+      hidePopTip();
+    }, { passive: true, capture: true });
+  }
+
+  // ---------- Antigravity 6-Cell Metric & Tooltip Builders ----------
+  function buildReqTip(h) {
+    if (!h || h.success_rate == null || !Number.isFinite(h.success_rate)) return '';
+    return `成功 ${fmtInt(h.success_calls || 0)} · 失败 ${fmtInt(h.failure_calls || 0)} · 累计总成功率 ${fmtPct(h.success_rate, 1)}`;
+  }
+
+  function buildTokensTip(h) {
+    if (!h || !(h.input_tokens > 0)) return '';
+    return `总输入 ${fmtCompact(h.input_tokens)} · 其中缓存读取命中 ${fmtCompact(h.cached_tokens || 0)}`;
+  }
+
+  function buildCostValueTip(h) {
+    if (!h) return '';
+    let msg = `按官方 API 单价折算实际计费 ${fmtCost(h.total_cost)}`;
+    if (h.cache_saved_cost > 0) {
+      msg += `（若无缓存原价约 ${fmtCost((h.total_cost || 0) + h.cache_saved_cost)}）`;
+    }
+    return msg;
+  }
+
+  function buildCacheHitTip(h) {
     if (!h) return '';
     const parts = [];
-    if (h.cache_hit_rate_24h != null && Number.isFinite(h.cache_hit_rate_24h)) {
-      parts.push(`近 24h 命中率 ${fmtPct(h.cache_hit_rate_24h, 1)}`);
-    }
     if (h.input_tokens > 0) {
       parts.push(`累计命中 ${fmtCompact(h.cached_tokens || 0)} / 总输入 ${fmtCompact(h.input_tokens)}`);
     }
-    if (h.cache_saved_cost > 0) {
-      let saved = `缓存约省 ${fmtCost(h.cache_saved_cost)}`;
-      if (h.cache_saved_cost_24h > 0) {
-        saved += `（24h 省 ${fmtCost(h.cache_saved_cost_24h)}）`;
-      }
-      parts.push(saved);
-    }
     if (h.success_rate != null && Number.isFinite(h.success_rate)) {
-      parts.push(`累计成功率 ${fmtPct(h.success_rate, 1)}`);
+      parts.push(`累计总成功率 ${fmtPct(h.success_rate, 1)}`);
     }
     return parts.join(' · ');
   }
 
-  function buildCostValueTitle(h) {
-    if (!h || !(h.cache_saved_cost > 0)) return '';
-    return `按官方 API 单价折算计费 ${fmtCost(h.total_cost)} · 缓存命中累计约省 ${fmtCost(h.cache_saved_cost)}`;
+  function buildCacheHit24hTip(h) {
+    if (!h) return '';
+    const parts = [];
+    if (h.cache_hit_rate_24h != null && Number.isFinite(h.cache_hit_rate_24h)) {
+      parts.push(`近 24h 缓存命中率 ${fmtPct(h.cache_hit_rate_24h, 1)}`);
+    }
+    if (h.input_tokens_24h > 0) {
+      parts.push(`命中 ${fmtCompact(h.cached_tokens_24h || 0)} / 输入 ${fmtCompact(h.input_tokens_24h)}`);
+    }
+    if (h.cache_saved_cost_24h > 0) {
+      parts.push(`近 24h 约省 ${fmtCost(h.cache_saved_cost_24h)}`);
+    }
+    return parts.join(' · ');
   }
 
-  function buildPoolCacheKpiTitle(summary) {
+  function buildCacheSavedTip(h) {
+    if (!h || !(h.cache_saved_cost > 0)) return '';
+    let msg = `按模型输入与缓存差价累计节省 ${fmtCost(h.cache_saved_cost)}`;
+    if (h.cache_saved_cost_24h > 0) {
+      msg += ` · 近 24h 省 ${fmtCost(h.cache_saved_cost_24h)}`;
+    }
+    return msg;
+  }
+
+  function buildAGAccountMetrics(acc) {
+    const h = acc.history || {};
+    const hasCacheHit = h.cache_hit_rate != null && Number.isFinite(h.cache_hit_rate);
+    const hasCacheHit24h = h.cache_hit_rate_24h != null && Number.isFinite(h.cache_hit_rate_24h);
+    const hasSaved = h.cache_saved_cost > 0;
+    return [
+      {
+        id: `ag-${acc.id}-req`,
+        label: '累计请求',
+        val: fmtCompact(h.total_requests),
+        color: '',
+        tip: buildReqTip(h),
+      },
+      {
+        id: `ag-${acc.id}-tok`,
+        label: '累计 Token',
+        val: fmtCompact(h.total_tokens),
+        color: '',
+        tip: buildTokensTip(h),
+      },
+      {
+        id: `ag-${acc.id}-cost`,
+        label: '估算价值',
+        val: fmtCost(h.total_cost),
+        color: '',
+        tip: buildCostValueTip(h),
+      },
+      {
+        id: `ag-${acc.id}-cache`,
+        label: '缓存命中',
+        val: hasCacheHit ? fmtPct(h.cache_hit_rate, 1) : '—',
+        color: cacheHitColor(hasCacheHit ? h.cache_hit_rate : null),
+        tip: buildCacheHitTip(h),
+      },
+      {
+        id: `ag-${acc.id}-cache24`,
+        label: '24h 命中',
+        val: hasCacheHit24h ? fmtPct(h.cache_hit_rate_24h, 1) : '—',
+        color: cacheHitColor(hasCacheHit24h ? h.cache_hit_rate_24h : null),
+        tip: buildCacheHit24hTip(h),
+      },
+      {
+        id: `ag-${acc.id}-saved`,
+        label: '缓存约省',
+        val: hasSaved ? fmtCost(h.cache_saved_cost) : (hasCacheHit ? '$0.00' : '—'),
+        color: hasSaved ? 'var(--q-high)' : 'var(--text-3)',
+        tip: buildCacheSavedTip(h),
+      },
+    ];
+  }
+
+  function buildPoolCacheKpiTip(summary) {
     if (!summary) return '';
     const parts = [];
+    if (summary.total_cost > 0) {
+      let costPart = `按官方 API 单价折算实际计费 ${fmtCost(summary.total_cost)}`;
+      if (summary.total_cache_saved_cost > 0) {
+        costPart += `（若无缓存原价约 ${fmtCost(summary.total_cost + summary.total_cache_saved_cost)}）`;
+      }
+      parts.push(costPart);
+    }
+    if (summary.weighted_cache_hit_rate != null && Number.isFinite(summary.weighted_cache_hit_rate)) {
+      parts.push(`加权累计缓存命中率 ${fmtPct(summary.weighted_cache_hit_rate, 1)}`);
+    }
     if (summary.weighted_cache_hit_rate_24h != null && Number.isFinite(summary.weighted_cache_hit_rate_24h)) {
-      parts.push(`近 24h 加权缓存命中率 ${fmtPct(summary.weighted_cache_hit_rate_24h, 1)}`);
+      parts.push(`近 24h 加权命中率 ${fmtPct(summary.weighted_cache_hit_rate_24h, 1)}`);
     }
     if (summary.total_cache_saved_cost > 0) {
       parts.push(`缓存命中累计约省 ${fmtCost(summary.total_cache_saved_cost)}`);
@@ -546,6 +870,7 @@
   // ---------- Gate & Shell Visibility + Shimmer Skeleton ----------
   function showGate(errMsg = '') {
     state.gateOpen = true;
+    hidePopTip();
     const gate = document.getElementById('passcode-gate');
     const shell = document.getElementById('app-shell');
     const errEl = document.getElementById('passcode-err');
@@ -689,8 +1014,18 @@
     }
     const clock = fmtClock(state.snapshot.generated_at_ms);
     const interval = pollIntervalSeconds();
+    const tipText = `快照同步于 ${clock} · 每 ${interval} 秒静默刷新（约 ${state.countdown} 秒后）`;
     el.textContent = `${clock} · ${state.countdown}s`;
-    el.setAttribute('title', `快照同步于 ${clock} · 每 ${interval} 秒静默刷新（约 ${state.countdown} 秒后）`);
+    el.removeAttribute('title');
+    el.classList.add('has-tip');
+    el.setAttribute('data-tip', tipText);
+    el.setAttribute('data-tip-title', '自动静默同步');
+    el.setAttribute('data-tip-id', 'topbar-sync-meta');
+    el.setAttribute('aria-label', `自动静默同步：${tipText}`);
+    if (popTipState.target === el && popTipState.el && !popTipState.el.hidden) {
+      syncPopTipContent(el);
+      positionPopTip();
+    }
   }
 
   const HISTORY_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -1058,10 +1393,10 @@
     const aisLabel = ais.status === 'online' ? '在线' : ais.status === 'degraded' ? '降级' : '离线';
 
     container.innerHTML = `
-      <a class="status-pill ${esc(ag.status)}" href="#section-antigravity" title="跳转至 Antigravity 号池（${esc(ag.cpamp_message || agLabel)}）">
+      <a ${tipElAttrs(`status-pill ${ag.status}`, 'topbar-badge-ag', 'Antigravity 号池', `点击跳转 · ${ag.cpamp_message || agLabel}`)} href="#section-antigravity">
         <span class="dot"></span><span>Antigravity</span>
       </a>
-      <a class="status-pill ${esc(ais.status)}" href="#section-aistudio" title="跳转至 AIStudio2API 号池（${esc(ais.status_message || aisLabel)}）">
+      <a ${tipElAttrs(`status-pill ${ais.status}`, 'topbar-badge-ais', 'AIStudio2API 号池', `点击跳转 · ${ais.status_message || aisLabel}`)} href="#section-aistudio">
         <span class="dot"></span><span>AIStudio2API</span>
       </a>
     `;
@@ -1104,19 +1439,22 @@
       const isEmpty = quotaLevel(w.remaining_percent) === 'empty';
       const dotCol = windowDotColor(w);
       const obsTag = w.observed_at_ms > 0
-        ? `<span class="win-sample-age age-target num" data-obs-ts="${w.observed_at_ms}" title="官方采样时刻: ${esc(fmtDateTime(w.observed_at_ms))}">${esc(fmtSampleAge(w.observed_at_ms))}</span>`
+        ? `<span ${tipElAttrs('win-sample-age age-target num', `ag-${acc.id}-${w.key}-obs`, '官方采样时刻', `采样于 ${fmtDateTime(w.observed_at_ms)}`)} data-obs-ts="${w.observed_at_ms}">${esc(fmtSampleAge(w.observed_at_ms))}</span>`
         : '';
       const resetHtml = w.stale
         ? `<span class="win-reset-pill">等待采样</span>`
-        : `<span class="win-reset-pill" title="重置时刻: ${esc(fmtDateTime(w.reset_at_ms))}">↻ <span class="cd-target num" data-ts="${w.reset_at_ms}" data-compact="1">${esc(fmtCompactCountdown(w.reset_at_ms))}</span></span>`;
+        : `<span ${tipElAttrs('win-reset-pill', `ag-${acc.id}-${w.key}-reset`, '重置时刻', `${w.label} 预计于 ${fmtDateTime(w.reset_at_ms)} 重置`)}>↻ <span class="cd-target num" data-ts="${w.reset_at_ms}" data-compact="1">${esc(fmtCompactCountdown(w.reset_at_ms))}</span></span>`;
 
       const estRem = (w.estimated_remaining_percent != null && Number.isFinite(w.estimated_remaining_percent))
         ? Math.max(0, Math.min(pct, w.estimated_remaining_percent))
         : null;
       const estDelta = estRem != null ? (pct - estRem) : 0;
       const showLiveEst = estRem != null && estDelta >= 0.25;
+      const estTip = showLiveEst
+        ? `采样后新增 ${fmtInt(w.post_sample_requests || 0)} 次请求（${fmtCost(w.post_sample_cost_usd || 0)} · ${fmtCompact(w.post_sample_tokens || 0)}），实时估算余量约 ${fmtPct(estRem, 1)}`
+        : '';
       const estChip = showLiveEst
-        ? `<span class="win-est-chip num" title="采样后新增 ${fmtInt(w.post_sample_requests || 0)} 次请求（${fmtCost(w.post_sample_cost_usd || 0)} · ${fmtCompact(w.post_sample_tokens || 0)}），实时估算余量约 ${fmtPct(estRem, 1)}">实时估算 ~${fmtPct(estRem, 1)}</span>`
+        ? `<span ${tipElAttrs('win-est-chip num', `ag-${acc.id}-${w.key}-est`, '实时估算余量', estTip)}>实时估算 ~${fmtPct(estRem, 1)}</span>`
         : '';
 
       const reqBadge = w.current_requests > 0
@@ -1132,9 +1470,12 @@
         usageParts.push(`<span class="win-foot-forecast num">${tag} <strong>${fmtCost(w.forecast_cost)}</strong> · ${fmtCompact(w.forecast_tokens)}</span>`);
       }
 
+      const deltaTip = showLiveEst
+        ? `采样后新增 ${fmtInt(w.post_sample_requests || 0)} 次请求（${fmtCost(w.post_sample_cost_usd || 0)} · ${fmtCompact(w.post_sample_tokens || 0)}），实时估算消耗约 ${estDelta.toFixed(1)}%`
+        : '';
       const barInnerHtml = showLiveEst
         ? `<div class="bar-fill ${barColorClass(estRem)}" style="width:${estRem.toFixed(2)}%"></div>
-           <div class="bar-fill-delta" style="left:${estRem.toFixed(2)}%;width:${estDelta.toFixed(2)}%" title="采样后实时估算消耗约 ${estDelta.toFixed(1)}%"></div>`
+           <div ${tipElAttrs('bar-fill-delta', `ag-${acc.id}-${w.key}-delta`, '采样后估算消耗', deltaTip)} style="left:${estRem.toFixed(2)}%;width:${estDelta.toFixed(2)}%"></div>`
         : `<div class="bar-fill ${barColorClass(w.remaining_percent)}" style="width:${pct}%"></div>`;
 
       return `
@@ -1168,10 +1509,13 @@
           const dotCol = windowDotColor(w);
           const hasReset = !w.stale && w.reset_at_ms > Date.now();
           const resetSub = hasReset
-            ? `<span class="win-dormant-reset num" title="重置时刻: ${esc(fmtDateTime(w.reset_at_ms))}">↻ <span class="cd-target" data-ts="${w.reset_at_ms}" data-compact="1">${esc(fmtCompactCountdown(w.reset_at_ms))}</span></span>`
+            ? `<span ${tipElAttrs('win-dormant-reset num', `ag-${acc.id}-${w.key}-dreset`, '重置时刻', `${w.label} 预计于 ${fmtDateTime(w.reset_at_ms)} 重置`)}>↻ <span class="cd-target" data-ts="${w.reset_at_ms}" data-compact="1">${esc(fmtCompactCountdown(w.reset_at_ms))}</span></span>`
             : `<span class="win-dormant-reset">本窗零消耗</span>`;
+          const pillAttrs = hasReset
+            ? 'class="win-dormant-pill"'
+            : tipElAttrs('win-dormant-pill', `ag-${acc.id}-${w.key}-dormant`, w.label, '100% 满血未消耗');
           return `
-            <div class="win-dormant-pill" title="${esc(w.label)}：100% 满血未消耗">
+            <div ${pillAttrs}>
               <div class="win-dormant-left">
                 <span class="win-dot" style="background:${dotCol}"></span>
                 <div class="win-dormant-info">
@@ -1189,7 +1533,7 @@
     return `<div class="win-stack">${activeHtml}${dormantHtml}</div>`;
   }
 
-  function renderRecentStatusBlock(h) {
+  function renderRecentStatusBlock(h, accId = 'ag') {
     if (h.has_recent_buckets && Array.isArray(h.recent_buckets) && h.recent_buckets.length > 0) {
       const buckets = h.recent_buckets;
       const totalOk = h.recent_window_success || 0;
@@ -1200,6 +1544,7 @@
       const nowMs = state.snapshot?.generated_at_ms || Date.now();
       const bucketMs = 10 * 60 * 1000;
       const windowStartMs = nowMs - buckets.length * bucketMs;
+      const winMins = h.recent_window_minutes || 200;
 
       const blocksHtml = buckets.map((b, idx) => {
         const ok = b.success || 0;
@@ -1237,11 +1582,11 @@
           <div class="recent-head">
             <div class="recent-title-group">
               <span class="recent-title">近期状态</span>
-              <span class="recent-sub num">近 ${h.recent_window_minutes || 200}m · 10m/格${esc(latestHint)}</span>
+              <span class="recent-sub num">近 ${winMins}m · 10m/格${esc(latestHint)}</span>
             </div>
             <div class="recent-metrics num">
-              <span class="recent-pill-ok" title="近 200 分钟成功请求数"><span class="recent-pill-dot"></span><strong>${fmtInt(totalOk)}</strong></span>
-              <span class="recent-pill-fail ${totalFail > 0 ? 'has-fail' : ''}" title="近 200 分钟失败请求数"><span class="recent-pill-dot"></span><strong>${fmtInt(totalFail)}</strong></span>
+              <span ${tipElAttrs('recent-pill-ok', `ag-${accId}-recent-ok`, '近期成功请求', `近 ${winMins} 分钟成功 ${fmtInt(totalOk)} 次`)}><span class="recent-pill-dot"></span><strong>${fmtInt(totalOk)}</strong></span>
+              <span ${tipElAttrs(`recent-pill-fail ${totalFail > 0 ? 'has-fail' : ''}`, `ag-${accId}-recent-fail`, '近期失败请求', `近 ${winMins} 分钟失败 ${fmtInt(totalFail)} 次`)}><span class="recent-pill-dot"></span><strong>${fmtInt(totalFail)}</strong></span>
             </div>
           </div>
           <div class="cpamp-status-bar">
@@ -1254,9 +1599,9 @@
 
     const bars = h.recent_bars || [];
     if (bars.length > 0) {
-      const barNodes = bars.map(b => {
+      const barNodes = bars.map((b, idx) => {
         const tip = `${b.ok ? '成功' : '失败'}${b.status_code ? ' · HTTP ' + b.status_code : ''}${b.timestamp_ms ? ' · ' + fmtDateTime(b.timestamp_ms) : ''}`;
-        return `<div class="recent-bar ${b.ok ? 'ok' : 'fail'}" title="${esc(tip)}"></div>`;
+        return `<div ${tipElAttrs(`recent-bar ${b.ok ? 'ok' : 'fail'}`, `ag-${accId}-rbar-${idx}`, '近期请求', tip)}></div>`;
       }).join('');
       return `
         <div class="recent-box">
@@ -1286,35 +1631,19 @@
       ? `<span class="badge badge-ultra-hero">ULTRA</span>`
       : `<span class="badge ${tierBadgeClass(acc.tier)}">${esc(acc.tier)}</span>`;
 
-    const hasCacheHit = h.cache_hit_rate != null && Number.isFinite(h.cache_hit_rate);
-    const cacheHitText = hasCacheHit ? fmtPct(h.cache_hit_rate, 1) : '—';
-    const cacheHitCol = cacheHitColor(hasCacheHit ? h.cache_hit_rate : null);
-    const cacheHitTitle = buildCacheHitTitle(h);
-    const costTitle = buildCostValueTitle(h);
-
     const metricsHtml = h.available ? `
       <div class="ag-hero-metrics">
-        <div class="ag-hero-stat">
-          <span class="ag-hero-stat-lbl">累计请求</span>
-          <span class="ag-hero-stat-val num">${fmtCompact(h.total_requests)}</span>
-        </div>
-        <div class="ag-hero-stat">
-          <span class="ag-hero-stat-lbl">累计 Token</span>
-          <span class="ag-hero-stat-val num">${fmtCompact(h.total_tokens)}</span>
-        </div>
-        <div class="ag-hero-stat${costTitle ? ' has-tip' : ''}"${costTitle ? ` title="${esc(costTitle)}"` : ''}>
-          <span class="ag-hero-stat-lbl">估算价值</span>
-          <span class="ag-hero-stat-val num">${fmtCost(h.total_cost)}</span>
-        </div>
-        <div class="ag-hero-stat${cacheHitTitle ? ' has-tip' : ''}"${cacheHitTitle ? ` title="${esc(cacheHitTitle)}"` : ''}>
-          <span class="ag-hero-stat-lbl">缓存命中</span>
-          <span class="ag-hero-stat-val num" style="color:${cacheHitCol}">${cacheHitText}</span>
-        </div>
+        ${buildAGAccountMetrics(acc).map(m => `
+          <div ${tipElAttrs('ag-hero-stat', m.id, m.label, m.tip)}>
+            <span class="ag-hero-stat-lbl">${esc(m.label)}</span>
+            <span class="ag-hero-stat-val num"${m.color ? ` style="color:${m.color}"` : ''}>${m.val}</span>
+          </div>
+        `).join('')}
       </div>
     ` : `<span class="badge badge-amber">${esc(h.status_note || ag.cpamp_message || '历史统计待同步')}</span>`;
 
     const recentHtml = (h.available || h.has_recent_buckets)
-      ? renderRecentStatusBlock(h)
+      ? renderRecentStatusBlock(h, acc.id)
       : `
         <div class="recent-box" style="display:flex;align-items:center;justify-content:space-between;">
           <span class="recent-title">近期状态</span>
@@ -1363,35 +1692,19 @@
       ? `<span class="badge badge-ultra-hero">ULTRA</span>`
       : `<span class="badge ${tierBadgeClass(acc.tier)}">${esc(acc.tier)}</span>`;
 
-    const hasCacheHit = h.cache_hit_rate != null && Number.isFinite(h.cache_hit_rate);
-    const cacheHitText = hasCacheHit ? fmtPct(h.cache_hit_rate, 1) : '—';
-    const cacheHitCol = cacheHitColor(hasCacheHit ? h.cache_hit_rate : null);
-    const cacheHitTitle = buildCacheHitTitle(h);
-    const costTitle = buildCostValueTitle(h);
-
     const statsBlock = h.available ? `
       <div class="ag-stats-grid">
-        <div class="ag-stat-box">
-          <div class="ag-stat-label">累计请求</div>
-          <div class="ag-stat-val num">${fmtCompact(h.total_requests)}</div>
-        </div>
-        <div class="ag-stat-box">
-          <div class="ag-stat-label">累计 Token</div>
-          <div class="ag-stat-val num">${fmtCompact(h.total_tokens)}</div>
-        </div>
-        <div class="ag-stat-box${costTitle ? ' has-tip' : ''}"${costTitle ? ` title="${esc(costTitle)}"` : ''}>
-          <div class="ag-stat-label">估算价值</div>
-          <div class="ag-stat-val num">${fmtCost(h.total_cost)}</div>
-        </div>
-        <div class="ag-stat-box${cacheHitTitle ? ' has-tip' : ''}"${cacheHitTitle ? ` title="${esc(cacheHitTitle)}"` : ''}>
-          <div class="ag-stat-label">缓存命中</div>
-          <div class="ag-stat-val num" style="color:${cacheHitCol}">${cacheHitText}</div>
-        </div>
+        ${buildAGAccountMetrics(acc).map(m => `
+          <div ${tipElAttrs('ag-stat-box', m.id, m.label, m.tip)}>
+            <div class="ag-stat-label">${esc(m.label)}</div>
+            <div class="ag-stat-val num"${m.color ? ` style="color:${m.color}"` : ''}>${m.val}</div>
+          </div>
+        `).join('')}
       </div>
     ` : '';
 
     const recentBlock = (h.available || h.has_recent_buckets)
-      ? renderRecentStatusBlock(h)
+      ? renderRecentStatusBlock(h, acc.id)
       : `
         <div class="recent-box" style="display:flex;align-items:center;justify-content:space-between;">
           <span class="recent-title">近期状态</span>
@@ -1455,10 +1768,29 @@
       `).join('');
 
       const hasPoolCacheHit = ag.summary.weighted_cache_hit_rate != null && Number.isFinite(ag.summary.weighted_cache_hit_rate);
-      const poolCacheKpiTitle = buildPoolCacheKpiTitle(ag.summary);
-      const poolCacheSubHtml = hasPoolCacheHit
-        ? `<span>缓存命中 <strong style="color:${cacheHitColor(ag.summary.weighted_cache_hit_rate)}">${fmtPct(ag.summary.weighted_cache_hit_rate, 1)}</strong>${ag.summary.total_cache_saved_cost > 0 ? ' · 省 ' + fmtCost(ag.summary.total_cache_saved_cost) : ''}</span>`
-        : '—';
+      const hasPoolCacheHit24h = ag.summary.weighted_cache_hit_rate_24h != null && Number.isFinite(ag.summary.weighted_cache_hit_rate_24h);
+      const poolCacheKpiTip = ag.cpamp_status === 'ok' ? buildPoolCacheKpiTip(ag.summary) : '';
+
+      const poolSubParts = [];
+      if (ag.cpamp_status === 'ok') {
+        if (hasPoolCacheHit && hasPoolCacheHit24h) {
+          poolSubParts.push(
+            `缓存 <strong style="color:${cacheHitColor(ag.summary.weighted_cache_hit_rate)}">${fmtPct(ag.summary.weighted_cache_hit_rate, 1)}</strong> (24h <strong style="color:${cacheHitColor(ag.summary.weighted_cache_hit_rate_24h)}">${fmtPct(ag.summary.weighted_cache_hit_rate_24h, 1)}</strong>)`
+          );
+        } else if (hasPoolCacheHit) {
+          poolSubParts.push(
+            `缓存 <strong style="color:${cacheHitColor(ag.summary.weighted_cache_hit_rate)}">${fmtPct(ag.summary.weighted_cache_hit_rate, 1)}</strong>`
+          );
+        } else if (hasPoolCacheHit24h) {
+          poolSubParts.push(
+            `24h 缓存 <strong style="color:${cacheHitColor(ag.summary.weighted_cache_hit_rate_24h)}">${fmtPct(ag.summary.weighted_cache_hit_rate_24h, 1)}</strong>`
+          );
+        }
+        if (ag.summary.total_cache_saved_cost > 0) {
+          poolSubParts.push(`省 <strong style="color:var(--q-high)">${fmtCost(ag.summary.total_cache_saved_cost)}</strong>`);
+        }
+      }
+      const poolCacheSubHtml = poolSubParts.length ? `<span>${poolSubParts.join(' · ')}</span>` : '—';
 
       summaryHtml = `
         <div class="kpi-grid">
@@ -1472,7 +1804,7 @@
             <div class="kpi-val num">${ag.cpamp_status === 'ok' ? fmtCompact(ag.summary.total_requests) : '待接入'}</div>
             <div class="kpi-sub num">${ag.cpamp_status === 'ok' ? '总 Token ' + fmtCompact(ag.summary.total_tokens) : esc(ag.cpamp_message || '待接入密钥')}</div>
           </div>
-          <div class="kpi-card${poolCacheKpiTitle ? ' has-tip' : ''}"${poolCacheKpiTitle ? ` title="${esc(poolCacheKpiTitle)}"` : ''}>
+          <div ${tipElAttrs('kpi-card', 'ag-kpi-cache', '估算价值 / 缓存命中', poolCacheKpiTip)}>
             <div class="kpi-label">估算价值 / 缓存命中</div>
             <div class="kpi-val num">${ag.cpamp_status === 'ok' ? fmtCost(ag.summary.total_cost) : '待接入'}</div>
             <div class="kpi-sub num">${poolCacheSubHtml}</div>
@@ -2322,6 +2654,9 @@
     }
 
     drawDualLamplighterChart(body, accId, hist, selected, pref);
+    if (popTipState.activeTipId && popTipState.activeTipId.startsWith(`lamp-${accId}-`)) {
+      restorePopTipAfterRender();
+    }
   }
 
   function drawDualLamplighterChart(container, accId, hist, selectedSeries, pref) {
@@ -2680,9 +3015,9 @@
           ${isMobile ? `<span class="lamp-kpi-hint">滑动看读数</span>` : ''}
         </div>
         <div class="lamp-kpi-stats num">
-          <span class="lamp-kpi-item" title="${esc(curTitle)}"><span>当前</span><strong style="color:${pctTextColor(selectedRow.remaining)}">${fmtRoundPct(selectedRow.remaining)}</strong></span>
-          <span class="lamp-kpi-item" title="${esc(paceTitle)}"><span>匀速</span><strong>${fmtRoundPct(paceNow)}</strong></span>
-          <span class="lamp-kpi-item" title="${esc(diffTitle)}"><span>差值</span><strong class="${diffCls}">${fmtDiffPct(diffNow)}</strong></span>
+          <span ${tipElAttrs('lamp-kpi-item', `lamp-${accId}-cur`, '当前采样余量', curTitle)}><span>当前</span><strong style="color:${pctTextColor(selectedRow.remaining)}">${fmtRoundPct(selectedRow.remaining)}</strong></span>
+          <span ${tipElAttrs('lamp-kpi-item', `lamp-${accId}-pace`, '匀速参考基线', paceTitle)}><span>匀速</span><strong>${fmtRoundPct(paceNow)}</strong></span>
+          <span ${tipElAttrs('lamp-kpi-item', `lamp-${accId}-diff`, '相对匀速差值', diffTitle)}><span>差值</span><strong class="${diffCls}">${fmtDiffPct(diffNow)}</strong></span>
           <span class="lamp-kpi-item"><span>距重置</span><strong>${resetDisplay}</strong></span>
         </div>
       `;
@@ -2732,6 +3067,9 @@
           ev.stopPropagation();
           emitHover(null, null, false);
         });
+      }
+      if (popTipState.target && !popTipState.target.isConnected) {
+        hidePopTip();
       }
     }
 
@@ -3311,7 +3649,7 @@
       .join('');
 
     const resetBadge = `
-      <span class="badge badge-blue num" title="每日北京时间 16:00 重置（下次：${esc(fmtDateTime(ais.next_reset_ms))}）">
+      <span ${tipElAttrs('badge badge-blue num', 'ais-reset-badge', '每日配额重置', `每日北京时间 16:00 重置（下次：${fmtDateTime(ais.next_reset_ms)}）`)}>
         距离 16:00 重置 <strong class="cd-hms" data-ts="${ais.next_reset_ms}">${fmtHMS(ais.next_reset_ms)}</strong>
       </span>
     `;
@@ -3371,7 +3709,7 @@
 
     const failOtherCnt = (pg.failed || 0) + (pg.canceled || 0);
     const ratioBarHtml = totalTok > 0 ? `
-      <div class="tok-ratio-wrap" title="输入 ${fmtCompact(inputTok)} · 思考 ${fmtCompact(reasonTok)} · 回复 ${fmtCompact(replyTok)}">
+      <div ${tipElAttrs('tok-ratio-wrap', 'ais-tok-ratio', '本轮 Token 构成', `输入 ${fmtCompact(inputTok)} · 思考 ${fmtCompact(reasonTok)} · 回复 ${fmtCompact(replyTok)}`)}>
         <div class="tok-ratio-bar">
           ${inputTok > 0 ? `<div class="tok-ratio-seg seg-input" style="width:${inPct.toFixed(2)}%"></div>` : ''}
           ${reasonTok > 0 ? `<div class="tok-ratio-seg seg-reason" style="width:${rsPct.toFixed(2)}%"></div>` : ''}
@@ -4301,7 +4639,7 @@
               : `${fmtInt(effRemReq)}/${fmtInt(limReq)}次`);
 
         return `
-          <div class="ais-m-row" title="${esc(rowTitle)}">
+          <div ${tipElAttrs('ais-m-row', `ais-${acc.id}-${m.model_id}`, friendly, rowTitle)}>
             <div class="ais-m-name">${esc(friendly)}</div>
             <div class="ais-m-nums num">${rowNums}</div>
             <div style="text-align:right;">${rightCol}</div>
@@ -4382,6 +4720,7 @@
     root.innerHTML = renderAntigravity(snap.antigravity) + renderAIStudio(snap.aistudio);
     bindDynamicEvents();
     hydrateAllCharts();
+    restorePopTipAfterRender();
   }
 
   function bindDynamicEvents() {
@@ -4633,12 +4972,16 @@
       }
     });
 
+    bindPopTipEvents();
+
     // Debounced resize redraw for crisp non-distorted SVGs
     let resizeTimer = null;
     window.addEventListener('resize', () => {
+      if (popTipState.target) positionPopTip();
       clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => {
         if (state.snapshot && !state.gateOpen) redrawVisibleCharts();
+        if (popTipState.target) positionPopTip();
       }, 140);
     });
 
