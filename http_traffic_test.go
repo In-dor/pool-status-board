@@ -134,12 +134,15 @@ func makeSyntheticSnapshot(anchorMs, wallTsMs int64, geminiRem float64) Snapshot
 			CPAMPStatus: "ok",
 			UpdatedAtMs: wallTsMs,
 			Summary: AntigravityPoolSummary{
-				ActiveAccounts:      1,
-				TierCounts:          map[string]int{"Ultra": 1},
-				TotalRequests:       1200,
-				TotalTokens:         450_000_000,
-				TotalCost:           320.5,
-				WeightedSuccessRate: floatPtr(99.5),
+				ActiveAccounts:          1,
+				TierCounts:              map[string]int{"Ultra": 1},
+				TotalRequests:           1200,
+				TotalTokens:             450_000_000,
+				TotalCost:               320.5,
+				WeightedSuccessRate:     floatPtr(99.5),
+				WeightedCacheHitRate:    floatPtr(89.8),
+				WeightedCacheHitRate24h: floatPtr(93.2),
+				TotalCacheSavedCost:     20132.05,
 				WindowAverages: []AntigravityWindowAverage{
 					{Key: "gemini_5h", Label: "Gemini 5h", AvgRemainingPercent: geminiRem, AccountCount: 1},
 				},
@@ -160,6 +163,14 @@ func makeSyntheticSnapshot(anchorMs, wallTsMs int64, geminiRem float64) Snapshot
 						TotalTokens:         450_000_000,
 						TotalCost:           320.5,
 						SuccessRate:         floatPtr(99.5),
+						InputTokens:         10_000_000_000,
+						CachedTokens:        8_980_000_000,
+						CacheHitRate:        floatPtr(89.8),
+						CacheSavedCost:      20132.05,
+						InputTokens24h:      1_000_000_000,
+						CachedTokens24h:     932_000_000,
+						CacheHitRate24h:     floatPtr(93.2),
+						CacheSavedCost24h:   3046.21,
 						LatestRequestAtMs:   anchorMs - 15_000,
 						HasRecentBuckets:    true,
 						RecentWindowMinutes: 200,
@@ -237,9 +248,9 @@ func TestStaticAssetsGzipETagAnd304(t *testing.T) {
 	}{
 		{"/", "index.html"},
 		{"/index.html", "index.html"},
-		{"/app.js?v=20261126-1", "app.js"},
-		{"/styles.css?v=20261126-1", "styles.css"},
-		{"/favicon.svg?v=20261126-1", "favicon.svg"},
+		{"/app.js?v=20261126-2", "app.js"},
+		{"/styles.css?v=20261126-2", "styles.css"},
+		{"/favicon.svg?v=20261126-2", "favicon.svg"},
 	}
 
 	for _, tc := range paths {
@@ -453,13 +464,32 @@ func TestSnapshotViewsGzipAndPayloadHierarchy(t *testing.T) {
 		t.Fatalf("summary view must retain aistudio.models")
 	}
 
-	// 3. compact: omits aistudio.accounts and aistudio.hourly_buckets, keeps antigravity.accounts[0].history.recent_buckets & aistudio.models
+	// 3. compact: omits aistudio.accounts and aistudio.hourly_buckets, keeps antigravity.accounts[0].history.recent_buckets & cache metrics & aistudio.models
 	cmpAIS := decodedJSON["compact"]["aistudio"].(map[string]any)
 	if _, exists := cmpAIS["accounts"]; exists {
 		t.Fatalf("compact view must omit aistudio.accounts")
 	}
 	if _, exists := cmpAIS["hourly_buckets"]; exists {
 		t.Fatalf("compact view must omit aistudio.hourly_buckets")
+	}
+	for _, viewName := range []string{"full", "summary", "compact"} {
+		agObj := decodedJSON[viewName]["antigravity"].(map[string]any)
+		agSum := agObj["summary"].(map[string]any)
+		for _, k := range []string{"weighted_success_rate", "weighted_cache_hit_rate", "weighted_cache_hit_rate_24h", "total_cache_saved_cost"} {
+			if _, exists := agSum[k]; !exists {
+				t.Fatalf("%s view antigravity.summary missing %q", viewName, k)
+			}
+		}
+		agAcc := agObj["accounts"].([]any)[0].(map[string]any)
+		agHist := agAcc["history"].(map[string]any)
+		for _, k := range []string{
+			"success_rate", "input_tokens", "cached_tokens", "cache_hit_rate", "cache_saved_cost",
+			"input_tokens_24h", "cached_tokens_24h", "cache_hit_rate_24h", "cache_saved_cost_24h",
+		} {
+			if _, exists := agHist[k]; !exists {
+				t.Fatalf("%s view antigravity.accounts[0].history missing %q", viewName, k)
+			}
+		}
 	}
 	cmpAG := decodedJSON["compact"]["antigravity"].(map[string]any)
 	cmpAGAcc := cmpAG["accounts"].([]any)[0].(map[string]any)
@@ -468,13 +498,19 @@ func TestSnapshotViewsGzipAndPayloadHierarchy(t *testing.T) {
 		t.Fatalf("compact view must retain antigravity account recent_buckets")
 	}
 
-	// 4. tui: omits antigravity account history, aistudio accounts & hourly_buckets; retains windows & models & playground
+	// 4. tui: omits antigravity account history, aistudio accounts & hourly_buckets; retains lightweight cache metrics, windows, models & playground
 	tuiAG := decodedJSON["tui"]["antigravity"].(map[string]any)
+	tuiAGSum := tuiAG["summary"].(map[string]any)
+	for _, k := range []string{"active_accounts", "weighted_cache_hit_rate", "weighted_cache_hit_rate_24h"} {
+		if _, exists := tuiAGSum[k]; !exists {
+			t.Fatalf("tui antigravity.summary missing %q", k)
+		}
+	}
 	tuiAGAcc := tuiAG["accounts"].([]any)[0].(map[string]any)
 	if _, exists := tuiAGAcc["history"]; exists {
 		t.Fatalf("tui view must omit antigravity account history")
 	}
-	for _, k := range []string{"id", "code_name", "tier", "status", "windows"} {
+	for _, k := range []string{"id", "code_name", "tier", "status", "cache_hit_rate", "cache_hit_rate_24h", "cache_saved_cost", "windows"} {
 		if _, exists := tuiAGAcc[k]; !exists {
 			t.Fatalf("tui antigravity account missing %q", k)
 		}

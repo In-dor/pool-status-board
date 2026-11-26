@@ -183,6 +183,57 @@
     }
   }
 
+  // Dedicated cache-efficiency color scale (low hit rate is not an outage, never red)
+  function cacheHitColor(pct) {
+    if (pct == null || !Number.isFinite(pct)) return 'var(--text-3)';
+    if (pct >= 80) return 'var(--q-high)';
+    if (pct >= 50) return 'var(--q-full)';
+    if (pct >= 20) return 'var(--q-medium)';
+    return 'var(--text-2)';
+  }
+
+  function buildCacheHitTitle(h) {
+    if (!h) return '';
+    const parts = [];
+    if (h.cache_hit_rate_24h != null && Number.isFinite(h.cache_hit_rate_24h)) {
+      parts.push(`近 24h 命中率 ${fmtPct(h.cache_hit_rate_24h, 1)}`);
+    }
+    if (h.input_tokens > 0) {
+      parts.push(`累计命中 ${fmtCompact(h.cached_tokens || 0)} / 总输入 ${fmtCompact(h.input_tokens)}`);
+    }
+    if (h.cache_saved_cost > 0) {
+      let saved = `缓存约省 ${fmtCost(h.cache_saved_cost)}`;
+      if (h.cache_saved_cost_24h > 0) {
+        saved += `（24h 省 ${fmtCost(h.cache_saved_cost_24h)}）`;
+      }
+      parts.push(saved);
+    }
+    if (h.success_rate != null && Number.isFinite(h.success_rate)) {
+      parts.push(`累计成功率 ${fmtPct(h.success_rate, 1)}`);
+    }
+    return parts.join(' · ');
+  }
+
+  function buildCostValueTitle(h) {
+    if (!h || !(h.cache_saved_cost > 0)) return '';
+    return `按官方 API 单价折算计费 ${fmtCost(h.total_cost)} · 缓存命中累计约省 ${fmtCost(h.cache_saved_cost)}`;
+  }
+
+  function buildPoolCacheKpiTitle(summary) {
+    if (!summary) return '';
+    const parts = [];
+    if (summary.weighted_cache_hit_rate_24h != null && Number.isFinite(summary.weighted_cache_hit_rate_24h)) {
+      parts.push(`近 24h 加权缓存命中率 ${fmtPct(summary.weighted_cache_hit_rate_24h, 1)}`);
+    }
+    if (summary.total_cache_saved_cost > 0) {
+      parts.push(`缓存命中累计约省 ${fmtCost(summary.total_cache_saved_cost)}`);
+    }
+    if (summary.weighted_success_rate != null && Number.isFinite(summary.weighted_success_rate)) {
+      parts.push(`加权总成功率 ${fmtPct(summary.weighted_success_rate, 1)}`);
+    }
+    return parts.join(' · ');
+  }
+
   function healthBadgeClass(pct) {
     const lvl = quotaLevel(pct);
     switch (lvl) {
@@ -1235,6 +1286,12 @@
       ? `<span class="badge badge-ultra-hero">ULTRA</span>`
       : `<span class="badge ${tierBadgeClass(acc.tier)}">${esc(acc.tier)}</span>`;
 
+    const hasCacheHit = h.cache_hit_rate != null && Number.isFinite(h.cache_hit_rate);
+    const cacheHitText = hasCacheHit ? fmtPct(h.cache_hit_rate, 1) : '—';
+    const cacheHitCol = cacheHitColor(hasCacheHit ? h.cache_hit_rate : null);
+    const cacheHitTitle = buildCacheHitTitle(h);
+    const costTitle = buildCostValueTitle(h);
+
     const metricsHtml = h.available ? `
       <div class="ag-hero-metrics">
         <div class="ag-hero-stat">
@@ -1245,13 +1302,13 @@
           <span class="ag-hero-stat-lbl">累计 Token</span>
           <span class="ag-hero-stat-val num">${fmtCompact(h.total_tokens)}</span>
         </div>
-        <div class="ag-hero-stat">
+        <div class="ag-hero-stat${costTitle ? ' has-tip' : ''}"${costTitle ? ` title="${esc(costTitle)}"` : ''}>
           <span class="ag-hero-stat-lbl">估算价值</span>
           <span class="ag-hero-stat-val num">${fmtCost(h.total_cost)}</span>
         </div>
-        <div class="ag-hero-stat">
-          <span class="ag-hero-stat-lbl">成功率</span>
-          <span class="ag-hero-stat-val num" style="color:${h.success_rate != null ? pctTextColor(h.success_rate) : 'inherit'}">${h.success_rate != null ? fmtPct(h.success_rate, 1) : '—'}</span>
+        <div class="ag-hero-stat${cacheHitTitle ? ' has-tip' : ''}"${cacheHitTitle ? ` title="${esc(cacheHitTitle)}"` : ''}>
+          <span class="ag-hero-stat-lbl">缓存命中</span>
+          <span class="ag-hero-stat-val num" style="color:${cacheHitCol}">${cacheHitText}</span>
         </div>
       </div>
     ` : `<span class="badge badge-amber">${esc(h.status_note || ag.cpamp_message || '历史统计待同步')}</span>`;
@@ -1306,6 +1363,12 @@
       ? `<span class="badge badge-ultra-hero">ULTRA</span>`
       : `<span class="badge ${tierBadgeClass(acc.tier)}">${esc(acc.tier)}</span>`;
 
+    const hasCacheHit = h.cache_hit_rate != null && Number.isFinite(h.cache_hit_rate);
+    const cacheHitText = hasCacheHit ? fmtPct(h.cache_hit_rate, 1) : '—';
+    const cacheHitCol = cacheHitColor(hasCacheHit ? h.cache_hit_rate : null);
+    const cacheHitTitle = buildCacheHitTitle(h);
+    const costTitle = buildCostValueTitle(h);
+
     const statsBlock = h.available ? `
       <div class="ag-stats-grid">
         <div class="ag-stat-box">
@@ -1316,13 +1379,13 @@
           <div class="ag-stat-label">累计 Token</div>
           <div class="ag-stat-val num">${fmtCompact(h.total_tokens)}</div>
         </div>
-        <div class="ag-stat-box">
+        <div class="ag-stat-box${costTitle ? ' has-tip' : ''}"${costTitle ? ` title="${esc(costTitle)}"` : ''}>
           <div class="ag-stat-label">估算价值</div>
           <div class="ag-stat-val num">${fmtCost(h.total_cost)}</div>
         </div>
-        <div class="ag-stat-box">
-          <div class="ag-stat-label">成功率</div>
-          <div class="ag-stat-val num" style="color:${h.success_rate != null ? pctTextColor(h.success_rate) : 'inherit'}">${h.success_rate != null ? fmtPct(h.success_rate, 1) : '—'}</div>
+        <div class="ag-stat-box${cacheHitTitle ? ' has-tip' : ''}"${cacheHitTitle ? ` title="${esc(cacheHitTitle)}"` : ''}>
+          <div class="ag-stat-label">缓存命中</div>
+          <div class="ag-stat-val num" style="color:${cacheHitCol}">${cacheHitText}</div>
         </div>
       </div>
     ` : '';
@@ -1391,6 +1454,12 @@
         </span>
       `).join('');
 
+      const hasPoolCacheHit = ag.summary.weighted_cache_hit_rate != null && Number.isFinite(ag.summary.weighted_cache_hit_rate);
+      const poolCacheKpiTitle = buildPoolCacheKpiTitle(ag.summary);
+      const poolCacheSubHtml = hasPoolCacheHit
+        ? `<span>缓存命中 <strong style="color:${cacheHitColor(ag.summary.weighted_cache_hit_rate)}">${fmtPct(ag.summary.weighted_cache_hit_rate, 1)}</strong>${ag.summary.total_cache_saved_cost > 0 ? ' · 省 ' + fmtCost(ag.summary.total_cache_saved_cost) : ''}</span>`
+        : '—';
+
       summaryHtml = `
         <div class="kpi-grid">
           <div class="kpi-card">
@@ -1403,10 +1472,10 @@
             <div class="kpi-val num">${ag.cpamp_status === 'ok' ? fmtCompact(ag.summary.total_requests) : '待接入'}</div>
             <div class="kpi-sub num">${ag.cpamp_status === 'ok' ? '总 Token ' + fmtCompact(ag.summary.total_tokens) : esc(ag.cpamp_message || '待接入密钥')}</div>
           </div>
-          <div class="kpi-card">
-            <div class="kpi-label">估算价值 / 成功率</div>
+          <div class="kpi-card${poolCacheKpiTitle ? ' has-tip' : ''}"${poolCacheKpiTitle ? ` title="${esc(poolCacheKpiTitle)}"` : ''}>
+            <div class="kpi-label">估算价值 / 缓存命中</div>
             <div class="kpi-val num">${ag.cpamp_status === 'ok' ? fmtCost(ag.summary.total_cost) : '待接入'}</div>
-            <div class="kpi-sub num">${ag.summary.weighted_success_rate != null ? '成功率 ' + fmtPct(ag.summary.weighted_success_rate, 1) : '—'}</div>
+            <div class="kpi-sub num">${poolCacheSubHtml}</div>
           </div>
           <div class="kpi-card">
             <div class="kpi-label">各窗口平均余量</div>

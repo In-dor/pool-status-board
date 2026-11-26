@@ -24,13 +24,16 @@ type AntigravityPool struct {
 }
 
 type AntigravityPoolSummary struct {
-	ActiveAccounts      int                        `json:"active_accounts"`
-	TierCounts          map[string]int             `json:"tier_counts"`
-	TotalRequests       int64                      `json:"total_requests"`
-	TotalTokens         int64                      `json:"total_tokens"`
-	TotalCost           float64                    `json:"total_cost"`
-	WeightedSuccessRate *float64                   `json:"weighted_success_rate"`
-	WindowAverages      []AntigravityWindowAverage `json:"window_averages"`
+	ActiveAccounts          int                        `json:"active_accounts"`
+	TierCounts              map[string]int             `json:"tier_counts"`
+	TotalRequests           int64                      `json:"total_requests"`
+	TotalTokens             int64                      `json:"total_tokens"`
+	TotalCost               float64                    `json:"total_cost"`
+	WeightedSuccessRate     *float64                   `json:"weighted_success_rate"`
+	WeightedCacheHitRate    *float64                   `json:"weighted_cache_hit_rate,omitempty"`     // 0..100, round2
+	WeightedCacheHitRate24h *float64                   `json:"weighted_cache_hit_rate_24h,omitempty"` // 0..100, round2
+	TotalCacheSavedCost     float64                    `json:"total_cache_saved_cost,omitempty"`      // USD, round2
+	WindowAverages          []AntigravityWindowAverage `json:"window_averages"`
 }
 
 type AntigravityWindowAverage struct {
@@ -61,6 +64,14 @@ type AntigravityAccountHistory struct {
 	TotalTokens         int64                     `json:"total_tokens"`
 	TotalCost           float64                   `json:"total_cost"`
 	SuccessRate         *float64                  `json:"success_rate"` // 0..100
+	InputTokens         int64                     `json:"input_tokens,omitempty"`
+	CachedTokens        int64                     `json:"cached_tokens,omitempty"`
+	CacheHitRate        *float64                  `json:"cache_hit_rate,omitempty"`      // 0..100, round2
+	CacheSavedCost      float64                   `json:"cache_saved_cost,omitempty"`    // USD, round2
+	InputTokens24h      int64                     `json:"input_tokens_24h,omitempty"`
+	CachedTokens24h     int64                     `json:"cached_tokens_24h,omitempty"`
+	CacheHitRate24h     *float64                  `json:"cache_hit_rate_24h,omitempty"`  // 0..100, round2
+	CacheSavedCost24h   float64                   `json:"cache_saved_cost_24h,omitempty"` // USD, round2
 	LatestRequestAtMs   int64                     `json:"latest_request_at_ms,omitempty"`
 	HasRecentBuckets    bool                      `json:"has_recent_buckets"`
 	RecentWindowMinutes int                       `json:"recent_window_minutes"` // 200 (20 x 10m)
@@ -328,15 +339,20 @@ type antigravityPoolTUIView struct {
 }
 
 type antigravitySummaryTUIView struct {
-	ActiveAccounts int `json:"active_accounts"`
+	ActiveAccounts          int      `json:"active_accounts"`
+	WeightedCacheHitRate    *float64 `json:"weighted_cache_hit_rate,omitempty"`
+	WeightedCacheHitRate24h *float64 `json:"weighted_cache_hit_rate_24h,omitempty"`
 }
 
 type antigravityAccountTUI struct {
-	ID       string              `json:"id"`
-	CodeName string              `json:"code_name"`
-	Tier     string              `json:"tier"`
-	Status   string              `json:"status"`
-	Windows  []AntigravityWindow `json:"windows"`
+	ID              string              `json:"id"`
+	CodeName        string              `json:"code_name"`
+	Tier            string              `json:"tier"`
+	Status          string              `json:"status"`
+	CacheHitRate    *float64            `json:"cache_hit_rate,omitempty"`
+	CacheHitRate24h *float64            `json:"cache_hit_rate_24h,omitempty"`
+	CacheSavedCost  float64             `json:"cache_saved_cost,omitempty"`
+	Windows         []AntigravityWindow `json:"windows"`
 }
 
 type aiStudioPoolTUIView struct {
@@ -419,11 +435,14 @@ func buildSnapshotTUIView(snap Snapshot) snapshotTUIView {
 			wins = []AntigravityWindow{}
 		}
 		accounts = append(accounts, antigravityAccountTUI{
-			ID:       acc.ID,
-			CodeName: acc.CodeName,
-			Tier:     acc.Tier,
-			Status:   acc.Status,
-			Windows:  wins,
+			ID:              acc.ID,
+			CodeName:        acc.CodeName,
+			Tier:            acc.Tier,
+			Status:          acc.Status,
+			CacheHitRate:    acc.History.CacheHitRate,
+			CacheHitRate24h: acc.History.CacheHitRate24h,
+			CacheSavedCost:  acc.History.CacheSavedCost,
+			Windows:         wins,
 		})
 	}
 	models := snap.AIStudio.Models
@@ -442,7 +461,9 @@ func buildSnapshotTUIView(snap Snapshot) snapshotTUIView {
 			Status:        snap.Antigravity.Status,
 			StatusMessage: snap.Antigravity.StatusMessage,
 			Summary: antigravitySummaryTUIView{
-				ActiveAccounts: snap.Antigravity.Summary.ActiveAccounts,
+				ActiveAccounts:          snap.Antigravity.Summary.ActiveAccounts,
+				WeightedCacheHitRate:    snap.Antigravity.Summary.WeightedCacheHitRate,
+				WeightedCacheHitRate24h: snap.Antigravity.Summary.WeightedCacheHitRate24h,
 			},
 			Accounts: accounts,
 		},

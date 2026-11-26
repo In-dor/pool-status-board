@@ -34,6 +34,7 @@ type CPAConfig struct {
 type CPACollector struct {
 	cfg    CPAConfig
 	client *http.Client
+	nowFn  func() time.Time
 
 	keyMu         sync.Mutex
 	lastKeyMtime  time.Time
@@ -51,6 +52,13 @@ type CPACollector struct {
 	fbCacheMu sync.Mutex
 	fbCache   map[forecastBaseCacheKey]cachedForecastBase
 
+	priceCacheMu sync.Mutex
+	priceCache   map[string]modelPriceEntry
+	priceCacheAt time.Time
+
+	analyticsCacheMu sync.Mutex
+	analyticsCache   *cachedCPAMPAnalytics
+
 	histStoreMu sync.RWMutex
 	histStore   *cpaHistoryStore
 }
@@ -67,9 +75,17 @@ func NewCPACollector(cfg CPAConfig) *CPACollector {
 				TLSHandshakeTimeout: 5 * time.Second,
 			},
 		},
+		nowFn:         time.Now,
 		histFileCache: map[string]cachedLampFile{},
 		fbCache:       map[forecastBaseCacheKey]cachedForecastBase{},
 	}
+}
+
+func (c *CPACollector) now() time.Time {
+	if c.nowFn != nil {
+		return c.nowFn()
+	}
+	return time.Now()
 }
 
 // CheckLamplighterStateChanged performs a lightweight read-only os.Stat check on
@@ -155,6 +171,7 @@ type internalCPAAccount struct {
 	recentWindowSuccess int64
 	recentWindowFailure int64
 	recentWindowRate    *float64
+	maxWindowLastSeenMs int64
 	history             AntigravityAccountHistory
 }
 
@@ -165,6 +182,10 @@ const (
 	lampResetDriftSec        = 60
 	lampResetJumpPercent     = 5.0
 	lampDefaultStepSec       = 900 // 15 minutes
+	modelPricesCacheTTL      = 10 * time.Minute
+	analyticsMinRefreshGap   = 15 * time.Second
+	analyticsIdleRefreshTTL  = 5 * time.Minute
+	analyticsWindowAlignMs   = 5 * 60 * 1000
 )
 
 type lampParsedSample struct {
@@ -444,8 +465,93 @@ type cpampWindowUsageItem struct {
 	ScopeMatchStatus string  `json:"scope_match_status"`
 }
 
+type cpampAnalyticsReq struct {
+	FromMs  int64                 `json:"from_ms"`
+	ToMs    int64                 `json:"to_ms"`
+	Include cpampAnalyticsInclude `json:"include"`
+	Filters cpampAnalyticsFilters `json:"filters"`
+}
+
+type cpampAnalyticsInclude struct {
+	AccountStats bool `json:"account_stats"`
+}
+
+type cpampAnalyticsFilters struct {
+	Providers   []string `json:"providers,omitempty"`
+	AuthIndices []string `json:"auth_indices,omitempty"`
+}
+
+type cpampAnalyticsResp struct {
+	GeneratedAtMs int64                  `json:"generated_at_ms"`
+	Granularity   string                 `json:"granularity"`
+	AccountStats  []cpampAccountStatItem `json:"account_stats"`
+}
+
+type cpampAccountStatItem struct {
+	ID                   string                  `json:"id"`
+	AccountSnapshot      string                  `json:"account_snapshot"`
+	AuthLabelSnapshot    string                  `json:"auth_label_snapshot"`
+	AuthProviderSnapshot string                  `json:"auth_provider_snapshot"`
+	AuthIndices          []json.RawMessage       `json:"auth_indices"`
+	Sources              []string                `json:"sources"`
+	InputTokens          int64                   `json:"input_tokens"`
+	CachedTokens         int64                   `json:"cached_tokens"`
+	CacheReadTokens      int64                   `json:"cache_read_tokens"`
+	CacheCreationTokens  int64                   `json:"cache_creation_tokens"`
+	LastSeenMs           int64                   `json:"last_seen_ms"`
+	Models               []cpampAccountModelStat `json:"models"`
+}
+
+type cpampAccountModelStat struct {
+	Model               string `json:"model"`
+	InputTokens         int64  `json:"input_tokens"`
+	CachedTokens        int64  `json:"cached_tokens"`
+	CacheReadTokens     int64  `json:"cache_read_tokens"`
+	CacheCreationTokens int64  `json:"cache_creation_tokens"`
+	CacheHitTokens      int64  `json:"cache_hit_tokens"`
+	CacheHitInputTokens int64  `json:"cache_hit_input_tokens"`
+}
+
+type cpampModelPricesResp struct {
+	Prices map[string]cpampModelPrice `json:"prices"`
+}
+
+type cpampModelPrice struct {
+	Prompt              float64  `json:"prompt"`
+	CacheRead           *float64 `json:"cacheRead"`
+	CacheReadSnake      *float64 `json:"cache_read"`
+	Cache               *float64 `json:"cache"`
+	PromptConfigured    *bool    `json:"promptConfigured,omitempty"`
+	CacheReadConfigured *bool    `json:"cacheReadConfigured,omitempty"`
+	CacheConfigured     *bool    `json:"cacheConfigured,omitempty"`
+}
+
+type modelPriceEntry struct {
+	prompt    float64
+	cacheRead float64
+}
+
+type cachedAccountCacheStats struct {
+	InputTokens       int64
+	CachedTokens      int64
+	CacheHitRate      *float64
+	CacheSavedCost    float64
+	InputTokens24h    int64
+	CachedTokens24h   int64
+	CacheHitRate24h   *float64
+	CacheSavedCost24h float64
+}
+
+type cachedCPAMPAnalytics struct {
+	accountsSig    string
+	maxLatestReqMs int64
+	totalRequests  int64
+	fetchedAt      time.Time
+	byAccountKey   map[string]cachedAccountCacheStats
+}
+
 func (c *CPACollector) Collect(ctx context.Context) AntigravityPool {
-	now := time.Now()
+	now := c.now()
 	nowMs := now.UnixMilli()
 
 	pool := AntigravityPool{
@@ -577,6 +683,7 @@ func (c *CPACollector) Collect(ctx context.Context) AntigravityPool {
 			if statusCode, wErr := c.enrichWindowUsage(ctx, adminKey, filtered, nowMs); wErr != nil {
 				log.Printf("[cpa] account-window-usage warning (status=%d)", statusCode)
 			}
+			c.enrichCacheAnalytics(ctx, adminKey, filtered, now)
 		}
 	}
 
@@ -596,6 +703,9 @@ func (c *CPACollector) Collect(ctx context.Context) AntigravityPool {
 
 	var totalReq, totalSuccessCalls, totalTok int64
 	var totalCost float64
+	var sumInputTok, sumCachedTok int64
+	var sumInputTok24h, sumCachedTok24h int64
+	var totalCacheSavedCost float64
 	hasAnyHistory := false
 
 	for _, acc := range filtered {
@@ -624,6 +734,17 @@ func (c *CPACollector) Collect(ctx context.Context) AntigravityPool {
 			totalSuccessCalls += acc.history.SuccessCalls
 			totalTok += acc.history.TotalTokens
 			totalCost += acc.history.TotalCost
+			if acc.history.InputTokens > 0 {
+				sumInputTok += acc.history.InputTokens
+				sumCachedTok += acc.history.CachedTokens
+			}
+			if acc.history.InputTokens24h > 0 {
+				sumInputTok24h += acc.history.InputTokens24h
+				sumCachedTok24h += acc.history.CachedTokens24h
+			}
+			if acc.history.CacheSavedCost > 0 {
+				totalCacheSavedCost += acc.history.CacheSavedCost
+			}
 		} else if pool.CPAMPStatus != "ok" {
 			acc.history.StatusNote = pool.CPAMPMessage
 		}
@@ -701,6 +822,27 @@ func (c *CPACollector) Collect(ctx context.Context) AntigravityPool {
 	if hasAnyHistory && totalReq > 0 {
 		pool.Summary.WeightedSuccessRate = floatPtr(round2(float64(totalSuccessCalls) / float64(totalReq) * 100.0))
 	}
+	if sumInputTok > 0 {
+		clamped := sumCachedTok
+		if clamped > sumInputTok {
+			clamped = sumInputTok
+		}
+		if clamped < 0 {
+			clamped = 0
+		}
+		pool.Summary.WeightedCacheHitRate = floatPtr(round2(clampPercent(float64(clamped) / float64(sumInputTok) * 100.0)))
+	}
+	if sumInputTok24h > 0 {
+		clamped := sumCachedTok24h
+		if clamped > sumInputTok24h {
+			clamped = sumInputTok24h
+		}
+		if clamped < 0 {
+			clamped = 0
+		}
+		pool.Summary.WeightedCacheHitRate24h = floatPtr(round2(clampPercent(float64(clamped) / float64(sumInputTok24h) * 100.0)))
+	}
+	pool.Summary.TotalCacheSavedCost = round2(totalCacheSavedCost)
 
 	windowOrder := []string{"claude_5h", "claude_weekly", "gemini_5h", "gemini_weekly", "argon_weekly"}
 	for _, wk := range windowOrder {
@@ -1931,7 +2073,7 @@ func (c *CPACollector) getCachedForecastBase(key forecastBaseCacheKey) (cpampWin
 	if !ok {
 		return cpampWindowUsageItem{}, false
 	}
-	if time.Since(ent.CachedAt) > fbCacheMaxAge {
+	if c.now().Sub(ent.CachedAt) > fbCacheMaxAge {
 		delete(c.fbCache, key)
 		return cpampWindowUsageItem{}, false
 	}
@@ -2100,7 +2242,7 @@ func (c *CPACollector) enrichWindowUsage(ctx context.Context, adminKey string, a
 	if len(forecastBaseTargets) > 0 {
 		var fbResp cpampWindowUsageResp
 		if _, fbErr := c.doCPAMPJSON(ctx, http.MethodPost, "/v0/management/monitoring/account-window-usage", adminKey, cpampWindowUsageReq{Windows: forecastBaseTargets}, &fbResp); fbErr == nil {
-			now := time.Now()
+			now := c.now()
 			for _, it := range fbResp.Items {
 				if it.RequestKey == "" {
 					continue
@@ -2126,6 +2268,9 @@ func (c *CPACollector) enrichWindowUsage(ctx context.Context, adminKey string, a
 			if cur, ok := results[fmt.Sprintf("%s|%s|current", acc.rowKey, w.key)]; ok {
 				cp := cur
 				curPtr = &cp
+				if cp.Matched && cp.LastSeenMs > acc.maxWindowLastSeenMs {
+					acc.maxWindowLastSeenMs = cp.LastSeenMs
+				}
 			}
 			if fb, ok := results[fmt.Sprintf("%s|%s|forecast_base", acc.rowKey, w.key)]; ok {
 				cp := fb
@@ -2297,4 +2442,529 @@ func parseRawStringOrInt(raw json.RawMessage) string {
 		return strconv.FormatInt(n, 10)
 	}
 	return ""
+}
+
+func cloneFloatPtr(p *float64) *float64 {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+func accountCacheKey(acc *internalCPAAccount) string {
+	if idx := strings.TrimSpace(acc.authIndex); idx != "" {
+		return idx
+	}
+	return acc.publicID
+}
+
+func buildAccountsSignature(accounts []*internalCPAAccount) string {
+	keys := make([]string, 0, len(accounts))
+	for _, acc := range accounts {
+		keys = append(keys, acc.publicID+":"+accountCacheKey(acc))
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
+}
+
+func normalizeCPAMPSourceKey(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if idx := strings.LastIndexAny(s, "/\\"); idx >= 0 {
+		s = s[idx+1:]
+	}
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
+func extractModelCacheReadTokens(m cpampAccountModelStat) int64 {
+	var cr int64
+	if m.CacheReadTokens > 0 {
+		cr += m.CacheReadTokens
+	}
+	if m.CachedTokens > 0 {
+		cr += m.CachedTokens
+	}
+	if cr > 0 {
+		return cr
+	}
+	if m.CacheHitTokens > 0 {
+		return m.CacheHitTokens
+	}
+	return 0
+}
+
+func normalizeModelPrices(raw map[string]cpampModelPrice) map[string]modelPriceEntry {
+	out := make(map[string]modelPriceEntry, len(raw))
+	for name, p := range raw {
+		norm := strings.ToLower(strings.TrimSpace(name))
+		if norm == "" {
+			continue
+		}
+		if math.IsNaN(p.Prompt) || math.IsInf(p.Prompt, 0) || p.Prompt <= 0 {
+			continue
+		}
+		var cacheRead float64
+		var hasCacheRead bool
+		if p.CacheRead != nil {
+			cacheRead = *p.CacheRead
+			hasCacheRead = true
+		} else if p.CacheReadSnake != nil {
+			cacheRead = *p.CacheReadSnake
+			hasCacheRead = true
+		} else if p.Cache != nil {
+			if *p.Cache > 0 || (p.CacheConfigured != nil && *p.CacheConfigured) || (p.CacheReadConfigured != nil && *p.CacheReadConfigured) {
+				cacheRead = *p.Cache
+				hasCacheRead = true
+			}
+		}
+		if !hasCacheRead || math.IsNaN(cacheRead) || math.IsInf(cacheRead, 0) || cacheRead < 0 {
+			continue
+		}
+		out[norm] = modelPriceEntry{
+			prompt:    p.Prompt,
+			cacheRead: cacheRead,
+		}
+	}
+	return out
+}
+
+func lookupModelPrice(prices map[string]modelPriceEntry, model string) (modelPriceEntry, bool) {
+	if len(prices) == 0 {
+		return modelPriceEntry{}, false
+	}
+	norm := strings.ToLower(strings.TrimSpace(model))
+	if norm == "" {
+		return modelPriceEntry{}, false
+	}
+	pe, ok := prices[norm]
+	return pe, ok
+}
+
+func (c *CPACollector) getModelPrices(ctx context.Context, adminKey string, now time.Time) map[string]modelPriceEntry {
+	c.priceCacheMu.Lock()
+	cached := c.priceCache
+	cachedAt := c.priceCacheAt
+	c.priceCacheMu.Unlock()
+
+	if cached != nil && !cachedAt.IsZero() {
+		age := now.Sub(cachedAt)
+		if age >= 0 && age < modelPricesCacheTTL {
+			return cached
+		}
+	}
+
+	var resp cpampModelPricesResp
+	code, err := c.doCPAMPJSON(ctx, http.MethodGet, "/v0/management/model-prices", adminKey, nil, &resp)
+	if err != nil {
+		log.Printf("[cpa] model-prices warning (status=%d)", code)
+		if cached != nil {
+			return cached
+		}
+		return nil
+	}
+
+	parsed := normalizeModelPrices(resp.Prices)
+	c.priceCacheMu.Lock()
+	c.priceCache = parsed
+	c.priceCacheAt = now
+	c.priceCacheMu.Unlock()
+	return parsed
+}
+
+func (c *CPACollector) fetchCPAMPAnalytics(ctx context.Context, adminKey string, fromMs, toMs int64, authIndices []string) (*cpampAnalyticsResp, int, error) {
+	if fromMs < 1 {
+		fromMs = 1
+	}
+	if toMs < fromMs {
+		toMs = fromMs
+	}
+	req := cpampAnalyticsReq{
+		FromMs: fromMs,
+		ToMs:   toMs,
+		Include: cpampAnalyticsInclude{
+			AccountStats: true,
+		},
+		Filters: cpampAnalyticsFilters{
+			Providers:   []string{"antigravity"},
+			AuthIndices: authIndices,
+		},
+	}
+	var resp cpampAnalyticsResp
+	code, err := c.doCPAMPJSON(ctx, http.MethodPost, "/v0/management/monitoring/analytics", adminKey, req, &resp)
+	if err != nil {
+		return nil, code, err
+	}
+	return &resp, code, nil
+}
+
+type accountCacheAgg struct {
+	inputTokens  int64
+	cachedTokens int64
+	savedCost    float64
+	lastSeenMs   int64
+}
+
+func buildAnalyticsAccountMatcher(accounts []*internalCPAAccount) func(cpampAccountStatItem) *internalCPAAccount {
+	byAuthIdx := make(map[string]*internalCPAAccount, len(accounts))
+	bySource := make(map[string]*internalCPAAccount, len(accounts)*2)
+	sourceCollision := map[string]bool{}
+	bySnap := make(map[string]*internalCPAAccount, len(accounts)*2)
+	snapCollision := map[string]bool{}
+
+	addUnique := func(m map[string]*internalCPAAccount, col map[string]bool, key string, acc *internalCPAAccount) {
+		if key == "" {
+			return
+		}
+		if col[key] {
+			return
+		}
+		if prev, exists := m[key]; exists && prev != acc {
+			delete(m, key)
+			col[key] = true
+			return
+		}
+		m[key] = acc
+	}
+
+	for _, acc := range accounts {
+		if idx := strings.TrimSpace(acc.authIndex); idx != "" {
+			byAuthIdx[idx] = acc
+		}
+		if src := normalizeCPAMPSourceKey(acc.fileName); src != "" {
+			addUnique(bySource, sourceCollision, src, acc)
+			if stem := strings.TrimSuffix(src, ".json"); stem != src && stem != "" {
+				addUnique(bySource, sourceCollision, stem, acc)
+			}
+		}
+		if email := strings.ToLower(strings.TrimSpace(acc.email)); email != "" {
+			addUnique(bySnap, snapCollision, email, acc)
+		}
+		if label := strings.ToLower(strings.TrimSpace(acc.label)); label != "" {
+			addUnique(bySnap, snapCollision, label, acc)
+		}
+	}
+
+	return func(item cpampAccountStatItem) *internalCPAAccount {
+		for _, rawIdx := range item.AuthIndices {
+			if idx := parseRawStringOrInt(rawIdx); idx != "" {
+				if acc, ok := byAuthIdx[idx]; ok {
+					return acc
+				}
+			}
+		}
+		for _, rawSrc := range item.Sources {
+			if src := normalizeCPAMPSourceKey(rawSrc); src != "" {
+				if acc, ok := bySource[src]; ok {
+					return acc
+				}
+				if stem := strings.TrimSuffix(src, ".json"); stem != src && stem != "" {
+					if acc, ok := bySource[stem]; ok {
+						return acc
+					}
+				}
+			}
+		}
+		if snap := strings.ToLower(strings.TrimSpace(item.AccountSnapshot)); snap != "" {
+			if acc, ok := bySnap[snap]; ok {
+				return acc
+			}
+		}
+		if lbl := strings.ToLower(strings.TrimSpace(item.AuthLabelSnapshot)); lbl != "" {
+			if acc, ok := bySnap[lbl]; ok {
+				return acc
+			}
+		}
+		return nil
+	}
+}
+
+func aggregateAccountCacheStats(items []cpampAccountStatItem, accounts []*internalCPAAccount, prices map[string]modelPriceEntry) (map[string]accountCacheAgg, int64) {
+	matcher := buildAnalyticsAccountMatcher(accounts)
+	out := make(map[string]accountCacheAgg, len(accounts))
+	var maxSeen int64
+
+	for _, item := range items {
+		acc := matcher(item)
+		if acc == nil {
+			continue
+		}
+		key := accountCacheKey(acc)
+
+		itemIn := item.InputTokens
+		if itemIn < 0 {
+			itemIn = 0
+		}
+		var itemCached int64
+		if item.CacheReadTokens > 0 {
+			itemCached += item.CacheReadTokens
+		}
+		if item.CachedTokens > 0 {
+			itemCached += item.CachedTokens
+		}
+
+		var modelsIn, modelsCached int64
+		var itemSaved float64
+		for _, m := range item.Models {
+			if m.InputTokens > 0 {
+				modelsIn += m.InputTokens
+			}
+			mCached := extractModelCacheReadTokens(m)
+			if m.InputTokens > 0 && mCached > m.InputTokens {
+				mCached = m.InputTokens
+			}
+			modelsCached += mCached
+			if mCached > 0 && len(prices) > 0 {
+				if pe, ok := lookupModelPrice(prices, m.Model); ok && pe.prompt > pe.cacheRead {
+					itemSaved += float64(mCached) * (pe.prompt - pe.cacheRead) / 1_000_000.0
+				}
+			}
+		}
+
+		if itemIn == 0 && modelsIn > 0 {
+			itemIn = modelsIn
+		}
+		if itemCached == 0 && modelsCached > 0 {
+			itemCached = modelsCached
+		}
+
+		cur := out[key]
+		cur.inputTokens += itemIn
+		cur.cachedTokens += itemCached
+		cur.savedCost += itemSaved
+		if item.LastSeenMs > cur.lastSeenMs {
+			cur.lastSeenMs = item.LastSeenMs
+		}
+		if item.LastSeenMs > maxSeen {
+			maxSeen = item.LastSeenMs
+		}
+		out[key] = cur
+	}
+	return out, maxSeen
+}
+
+func finalizeCacheAgg(agg accountCacheAgg) (inputTokens, cachedTokens int64, rate *float64, savedCost float64) {
+	if agg.inputTokens > 0 {
+		inputTokens = agg.inputTokens
+		cachedTokens = agg.cachedTokens
+		if cachedTokens < 0 {
+			cachedTokens = 0
+		}
+		if cachedTokens > inputTokens {
+			cachedTokens = inputTokens
+		}
+		rate = floatPtr(round2(clampPercent(float64(cachedTokens) / float64(inputTokens) * 100.0)))
+	}
+	if agg.savedCost > 0 && !math.IsNaN(agg.savedCost) && !math.IsInf(agg.savedCost, 0) {
+		savedCost = round2(agg.savedCost)
+	}
+	return inputTokens, cachedTokens, rate, savedCost
+}
+
+func applyCachedAccountCacheStats(accounts []*internalCPAAccount, byKey map[string]cachedAccountCacheStats) {
+	if len(byKey) == 0 {
+		return
+	}
+	for _, acc := range accounts {
+		st, ok := byKey[accountCacheKey(acc)]
+		if !ok {
+			continue
+		}
+		acc.history.InputTokens = st.InputTokens
+		acc.history.CachedTokens = st.CachedTokens
+		acc.history.CacheHitRate = cloneFloatPtr(st.CacheHitRate)
+		acc.history.CacheSavedCost = st.CacheSavedCost
+		acc.history.InputTokens24h = st.InputTokens24h
+		acc.history.CachedTokens24h = st.CachedTokens24h
+		acc.history.CacheHitRate24h = cloneFloatPtr(st.CacheHitRate24h)
+		acc.history.CacheSavedCost24h = st.CacheSavedCost24h
+	}
+}
+
+func (c *CPACollector) enrichCacheAnalytics(ctx context.Context, adminKey string, accounts []*internalCPAAccount, now time.Time) {
+	if len(accounts) == 0 || adminKey == "" {
+		return
+	}
+
+	accountsSig := buildAccountsSignature(accounts)
+	var currentMaxLatestReqMs, currentTotalReq int64
+	authIdxSet := make(map[string]struct{}, len(accounts))
+	for _, acc := range accounts {
+		if acc.history.LatestRequestAtMs > currentMaxLatestReqMs {
+			currentMaxLatestReqMs = acc.history.LatestRequestAtMs
+		}
+		if acc.maxWindowLastSeenMs > currentMaxLatestReqMs {
+			currentMaxLatestReqMs = acc.maxWindowLastSeenMs
+		}
+		currentTotalReq += acc.history.TotalRequests
+		if idx := strings.TrimSpace(acc.authIndex); idx != "" {
+			authIdxSet[idx] = struct{}{}
+		}
+	}
+
+	c.analyticsCacheMu.Lock()
+	cached := c.analyticsCache
+	c.analyticsCacheMu.Unlock()
+
+	needRefresh := false
+	hasNewTraffic := false
+	if cached == nil || cached.accountsSig != accountsSig {
+		needRefresh = true
+	} else {
+		hasNewTraffic = currentMaxLatestReqMs > cached.maxLatestReqMs || currentTotalReq > cached.totalRequests
+		age := now.Sub(cached.fetchedAt)
+		if age < 0 {
+			needRefresh = true
+		} else if hasNewTraffic && age >= analyticsMinRefreshGap {
+			needRefresh = true
+		} else if age >= analyticsIdleRefreshTTL {
+			needRefresh = true
+		}
+	}
+
+	if !needRefresh {
+		applyCachedAccountCacheStats(accounts, cached.byAccountKey)
+		return
+	}
+
+	authIndices := make([]string, 0, len(authIdxSet))
+	for idx := range authIdxSet {
+		authIndices = append(authIndices, idx)
+	}
+	sort.Strings(authIndices)
+
+	nowMs := now.UnixMilli()
+	if nowMs < 2 {
+		nowMs = 2
+	}
+	alignedNowMs := (nowMs / analyticsWindowAlignMs) * analyticsWindowAlignMs
+	var allToMs, win24hFromMs, win24hToMs int64
+	if cached != nil && cached.accountsSig == accountsSig && !hasNewTraffic && alignedNowMs > 1 {
+		// Idle 5-minute refresh: align 24h bounds to 5m boundary so semantic ETag remains stable across polls.
+		allToMs = nowMs
+		win24hToMs = alignedNowMs
+		win24hFromMs = alignedNowMs - 24*3600*1000
+	} else {
+		// Initial fetch, account set change, or new traffic: capture up to nowMs with 5m-aligned 24h start.
+		allToMs = nowMs
+		win24hToMs = nowMs
+		win24hFromMs = ((nowMs - 24*3600*1000) / analyticsWindowAlignMs) * analyticsWindowAlignMs
+	}
+	if win24hFromMs < 1 {
+		win24hFromMs = 1
+	}
+	if win24hToMs <= win24hFromMs {
+		win24hToMs = win24hFromMs + 1
+	}
+
+	var wg sync.WaitGroup
+	var allResp, win24hResp *cpampAnalyticsResp
+	var allCode, win24hCode int
+	var allErr, win24hErr error
+	var prices map[string]modelPriceEntry
+
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		allResp, allCode, allErr = c.fetchCPAMPAnalytics(ctx, adminKey, 1, allToMs, authIndices)
+	}()
+	go func() {
+		defer wg.Done()
+		win24hResp, win24hCode, win24hErr = c.fetchCPAMPAnalytics(ctx, adminKey, win24hFromMs, win24hToMs, authIndices)
+	}()
+	go func() {
+		defer wg.Done()
+		prices = c.getModelPrices(ctx, adminKey, now)
+	}()
+	wg.Wait()
+
+	if allErr != nil && win24hErr != nil {
+		log.Printf("[cpa] monitoring/analytics warning (all=%d, 24h=%d)", allCode, win24hCode)
+		if cached != nil && cached.accountsSig == accountsSig {
+			applyCachedAccountCacheStats(accounts, cached.byAccountKey)
+		}
+		return
+	}
+
+	nextByKey := make(map[string]cachedAccountCacheStats, len(accounts))
+	if cached != nil && cached.accountsSig == accountsSig {
+		for k, v := range cached.byAccountKey {
+			nextByKey[k] = cachedAccountCacheStats{
+				InputTokens:       v.InputTokens,
+				CachedTokens:      v.CachedTokens,
+				CacheHitRate:      cloneFloatPtr(v.CacheHitRate),
+				CacheSavedCost:    v.CacheSavedCost,
+				InputTokens24h:    v.InputTokens24h,
+				CachedTokens24h:   v.CachedTokens24h,
+				CacheHitRate24h:   cloneFloatPtr(v.CacheHitRate24h),
+				CacheSavedCost24h: v.CacheSavedCost24h,
+			}
+		}
+	}
+
+	maxSeen := currentMaxLatestReqMs
+	if allErr == nil && allResp != nil {
+		allAggs, allMaxSeen := aggregateAccountCacheStats(allResp.AccountStats, accounts, prices)
+		if allMaxSeen > maxSeen {
+			maxSeen = allMaxSeen
+		}
+		for _, acc := range accounts {
+			k := accountCacheKey(acc)
+			st := nextByKey[k]
+			inTok, cachedTok, rate, saved := finalizeCacheAgg(allAggs[k])
+			st.InputTokens = inTok
+			st.CachedTokens = cachedTok
+			st.CacheHitRate = rate
+			st.CacheSavedCost = saved
+			nextByKey[k] = st
+		}
+	} else if allErr != nil {
+		log.Printf("[cpa] monitoring/analytics all-time warning (status=%d)", allCode)
+	}
+
+	if win24hErr == nil && win24hResp != nil {
+		w24Aggs, w24MaxSeen := aggregateAccountCacheStats(win24hResp.AccountStats, accounts, prices)
+		if w24MaxSeen > maxSeen {
+			maxSeen = w24MaxSeen
+		}
+		for _, acc := range accounts {
+			k := accountCacheKey(acc)
+			st := nextByKey[k]
+			inTok, cachedTok, rate, saved := finalizeCacheAgg(w24Aggs[k])
+			st.InputTokens24h = inTok
+			st.CachedTokens24h = cachedTok
+			st.CacheHitRate24h = rate
+			st.CacheSavedCost24h = saved
+			nextByKey[k] = st
+		}
+	} else if win24hErr != nil {
+		log.Printf("[cpa] monitoring/analytics 24h warning (status=%d)", win24hCode)
+	}
+
+	applyCachedAccountCacheStats(accounts, nextByKey)
+
+	if allErr == nil && win24hErr == nil {
+		c.analyticsCacheMu.Lock()
+		c.analyticsCache = &cachedCPAMPAnalytics{
+			accountsSig:    accountsSig,
+			maxLatestReqMs: maxSeen,
+			totalRequests:  currentTotalReq,
+			fetchedAt:      now,
+			byAccountKey:   nextByKey,
+		}
+		c.analyticsCacheMu.Unlock()
+	} else if cached == nil || cached.accountsSig != accountsSig {
+		// Partial initial fill: store what we got but allow retry after min refresh gap.
+		c.analyticsCacheMu.Lock()
+		c.analyticsCache = &cachedCPAMPAnalytics{
+			accountsSig:    accountsSig,
+			maxLatestReqMs: currentMaxLatestReqMs,
+			totalRequests:  currentTotalReq,
+			fetchedAt:      now.Add(-(analyticsIdleRefreshTTL - analyticsMinRefreshGap)),
+			byAccountKey:   nextByKey,
+		}
+		c.analyticsCacheMu.Unlock()
+	}
 }

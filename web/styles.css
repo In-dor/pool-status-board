@@ -1010,6 +1010,16 @@ button, select, input, a {
   color: var(--text-3);
   white-space: nowrap;
 }
+.ag-hero-stat.has-tip,
+.ag-stat-box.has-tip,
+.kpi-card.has-tip {
+  cursor: help;
+}
+.ag-hero-stat.has-tip .ag-hero-stat-lbl,
+.ag-stat-box.has-tip .ag-stat-label {
+  text-decoration: underline dotted color-mix(in srgb, var(--text-3) 55%, transparent);
+  text-underline-offset: 3px;
+}
 .ag-hero-stat-val {
   font-size: 15px;
   font-weight: 750;
